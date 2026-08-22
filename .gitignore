@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# GenLayer / gltest
+artifacts/
+.env
+gltest.config.yaml
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

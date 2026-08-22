@@ -1,0 +1,4 @@
+# TrueLogix test/dev dependencies
+# Direct-mode tests: python -m pytest tests/direct/ -q
+genlayer-test==0.29.2
+genvm-linter
