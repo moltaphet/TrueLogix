@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-ink-900 text-chalk font-sans antialiased;
+    background-image:
+      radial-gradient(80% 55% at 50% -10%, rgba(56, 189, 248, 0.08), transparent 60%),
+      radial-gradient(60% 40% at 100% 10%, rgba(167, 139, 250, 0.06), transparent 55%);
+    background-attachment: fixed;
+  }
+
+  ::selection {
+    background: rgba(52, 211, 153, 0.25);
+  }
+
+  :focus-visible {
+    outline: 2px solid #34d399;
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Thin blueprint scrollbars for code panels */
+  .scroll-slim {
+    scrollbar-width: thin;
+    scrollbar-color: #2a3348 transparent;
+  }
+  .scroll-slim::-webkit-scrollbar {
+    width: 7px;
+    height: 7px;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb {
+    background: #2a3348;
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  .scroll-slim::-webkit-scrollbar-thumb:hover {
+    background: #3a4560;
+    background-clip: content-box;
+  }
+  .scroll-slim::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scroll-slim::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .kicker {
+    @apply font-mono text-[11px] uppercase tracking-kicker text-fog;
+  }
+
+  .panel {
+    @apply rounded-2xl border border-line bg-ink-800/70 shadow-panel backdrop-blur-sm;
+  }
+
+  .hairline {
+    @apply border-line;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-5 py-3 font-medium
+      transition-all duration-200 focus-visible:outline focus-visible:outline-2;
+  }
+  .btn-primary {
+    @apply bg-verify text-ink-950 hover:brightness-110 hover:shadow-glowV disabled:opacity-50
+      disabled:cursor-not-allowed;
+  }
+  .btn-ghost {
+    @apply border border-line-bright text-chalk hover:border-fog hover:bg-white/5;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-line px-3 py-1
+      font-mono text-[11px] text-fog-bright;
+  }
+
+  /* JSON syntax accents */
+  .tok-key {
+    @apply text-agentA;
+  }
+  .tok-str {
+    @apply text-verify;
+  }
+  .tok-num {
+    @apply text-agentC;
+  }
+  .tok-bool {
+    @apply text-agentB;
+  }
+  .tok-null {
+    @apply text-fog;
+  }
+  .tok-punc {
+    @apply text-fog/70;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Honour reduced-motion: kill ambient/looping motion, keep content visible. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
