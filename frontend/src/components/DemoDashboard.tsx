@@ -41,6 +41,7 @@ export default function DemoDashboard() {
   const [running, setRunning] = useState(false);
   const [final, setFinal] = useState<EnvelopeC | null>(null);
   const [runId, setRunId] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
   const wallet = useWallet();
   const walletConnected = wallet.status === "connected";
@@ -53,6 +54,7 @@ export default function DemoDashboard() {
     if (running) return;
     setRunning(true);
     setFinal(null);
+    setError(null);
     setStages(EMPTY);
     setActive(null);
     const rid = runId + 1;
@@ -63,15 +65,23 @@ export default function DemoDashboard() {
         ? { provider: wallet.provider, address: wallet.address }
         : null;
 
-    for await (const ev of runConsensus(input, { wallet: walletHandle })) {
-      if (ev.phase === "running") setActive(ev.agent);
-      setStages((prev) => ({
-        ...prev,
-        [ev.agent]: { phase: ev.phase, envelope: ev.envelope ?? prev[ev.agent].envelope, votes: ev.votes ?? prev[ev.agent].votes },
-      }));
-      if (ev.agent === "C" && (ev.phase === "done" || ev.phase === "error") && ev.envelope) {
-        setFinal(ev.envelope as EnvelopeC);
+    try {
+      for await (const ev of runConsensus(input, { wallet: walletHandle })) {
+        if (ev.phase === "running") setActive(ev.agent);
+        setStages((prev) => ({
+          ...prev,
+          [ev.agent]: { phase: ev.phase, envelope: ev.envelope ?? prev[ev.agent].envelope, votes: ev.votes ?? prev[ev.agent].votes },
+        }));
+        if (ev.agent === "C" && (ev.phase === "done" || ev.phase === "error") && ev.envelope) {
+          setFinal(ev.envelope as EnvelopeC);
+        }
       }
+    } catch (err) {
+      // On-chain failure — surface the real SDK / contract error verbatim rather
+      // than silently substituting simulated data.
+      setError(err instanceof Error ? err.message : String(err));
+      setStages(EMPTY);
+      setFinal(null);
     }
     setActive(null);
     setRunning(false);
@@ -82,6 +92,7 @@ export default function DemoDashboard() {
     setInput(PRESETS[i].input);
     setStages(EMPTY);
     setFinal(null);
+    setError(null);
     setActive(null);
   }
 
@@ -167,6 +178,8 @@ export default function DemoDashboard() {
           <ConduitDiagram active={active} completed={completed} locked={locked} />
         </div>
 
+        {error && <ErrorBanner message={error} />}
+
         {final && <DecisionCard env={final} />}
 
         <div className="grid grid-cols-1 gap-5 md:grid-cols-3">
@@ -246,23 +259,55 @@ function AgentColumn({ agent, state }: { agent: AgentId; state: StageState }) {
   );
 }
 
+// NOTE: This quorum strip is an ILLUSTRATIVE UI animation, not live validator
+// data. The deployed contract returns an already-agreed result per stage, not a
+// per-validator vote tally, so the dots below are simulated for visualization
+// and are explicitly labelled as such so they are not read as on-chain votes.
 function QuorumStrip({ votes }: { votes: QuorumVote[] }) {
   const agree = votes.filter((v) => v.agree).length;
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
       <div className="flex gap-1">
         {votes.map((v, i) => (
           <span
             key={i}
             className="inline-block h-2.5 w-2.5 animate-blip rounded-[3px]"
             style={{ background: v.agree ? "#34D399" : "#FB7185", animationDelay: `${i * 70}ms` }}
-            title={`validator ${i + 1}: ${v.agree ? "agree" : "disagree"}`}
+            title="Simulated UI — not live validator data"
           />
         ))}
       </div>
       <span className="font-mono text-[10px] text-fog">
         {agree}/{VALIDATOR_COUNT} agree
       </span>
+      <span
+        className="rounded border border-line/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-fog/80"
+        title="This quorum strip is a UI illustration, not on-chain validator votes."
+      >
+        Simulated UI · not live validator data
+      </span>
+    </div>
+  );
+}
+
+function ErrorBanner({ message }: { message: string }) {
+  return (
+    <div className="panel p-5" style={{ borderColor: "#FB718566" }} role="alert">
+      <div className="flex items-start gap-3">
+        <span
+          className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md font-display text-sm font-bold"
+          style={{ background: "#FB71851f", color: "#FB7185", boxShadow: "0 0 0 1px #FB718555" }}
+        >
+          !
+        </span>
+        <div className="min-w-0">
+          <div className="font-mono text-[11px] uppercase tracking-kicker text-fog">on-chain call failed</div>
+          <p className="mt-1 break-words font-mono text-xs leading-relaxed text-fog-bright">{message}</p>
+          <p className="mt-2 text-[11px] text-fog">
+            The error above is reported directly from the contract or SDK. No simulated result was substituted.
+          </p>
+        </div>
+      </div>
     </div>
   );
 }
