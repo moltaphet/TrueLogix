@@ -79,10 +79,55 @@ function toMessage(err: unknown): string {
   }
 }
 
+// Every run_id the contract assigns has the exact form "run_<decimal>".
+const RUN_ID_RE = /run_\d+/;
+
+/**
+ * Best-effort extraction of the EXACT run_id this transaction produced, straight
+ * from its own finalized receipt. The write method `evaluate` returns
+ * {"run_id": ...}; genlayer-js surfaces that decoded return value under each
+ * leader receipt's `result` (studio/localnet auto-decode). Because this reads the
+ * transaction's OWN receipt, it can never resolve to another caller's run.
+ *
+ * Returns null when the receipt shape does not expose a decodable return value
+ * (e.g. networks that do not auto-decode); the caller then falls back to the
+ * deterministic, caller-keyed contract query.
+ */
+function extractRunIdFromReceipt(receipt: unknown): string | null {
+  const leaderReceipts = (receipt as any)?.consensus_data?.leader_receipt;
+  const list = Array.isArray(leaderReceipts)
+    ? leaderReceipts
+    : leaderReceipts
+      ? [leaderReceipts]
+      : [];
+  for (const lr of list) {
+    const result = lr?.result;
+    // Decoded form: { status: "return", payload: { readable: "<return value>" } }
+    const readable = result?.payload?.readable ?? result?.readable;
+    const candidate =
+      typeof readable === "string"
+        ? readable
+        : typeof result === "string"
+          ? result
+          : null;
+    if (candidate) {
+      const match = candidate.match(RUN_ID_RE);
+      if (match) return match[0];
+    }
+  }
+  return null;
+}
+
 /**
  * Submit source material to the deployed contract's `evaluate` write method,
  * signing with the connected browser wallet, then read back the EXACT run this
- * transaction produced (by its run_id) rather than the global latest record.
+ * transaction produced.
+ *
+ * Race-free by construction: the run_id is resolved AFTER submission from this
+ * transaction's own receipt return value (or, as a fallback, a caller-keyed
+ * contract query) - never by pre-reading the shared run counter and guessing.
+ * An interleaved evaluate() from another caller therefore cannot make us fetch
+ * someone else's record.
  *
  * On any SDK / network / contract failure this throws an {@link OnchainError}
  * carrying the underlying message. It never silently falls back to simulation.
@@ -111,21 +156,10 @@ export async function evaluateOnchain(
     throw new OnchainError(`Failed to initialize GenLayer client: ${toMessage(err)}`, err);
   }
 
-  // Read the run counter BEFORE submitting so we know the exact run_id this
-  // transaction will produce. The contract derives run_id = "run_<run_count>"
-  // from the pre-increment counter, so the run we submit is "run_<countBefore>".
-  let countBefore: number;
-  try {
-    const raw = await client.readContract({
-      address: CONTRACT,
-      functionName: "get_run_count",
-      args: [],
-    });
-    countBefore = Number(raw);
-    if (!Number.isFinite(countBefore)) throw new Error(`non-numeric run count "${raw}"`);
-  } catch (err) {
-    throw new OnchainError(`Failed to read run count from contract: ${toMessage(err)}`, err);
-  }
+  // NO pre-read of the shared run counter. Guessing "run_<countBefore>" is racy:
+  // another caller's evaluate() can advance the counter between the read and our
+  // write, so the guessed id could point at THEIR record. Instead we submit
+  // first, then resolve the exact id assigned to THIS transaction (below).
 
   // Write: run the A -> B -> C pipeline on-chain, signed by the wallet.
   let txHash: string;
@@ -147,17 +181,44 @@ export async function evaluateOnchain(
   }
 
   // Wait for THIS specific transaction to finalize before reading its result.
+  let receipt: unknown = null;
   try {
     if (client.waitForTransactionReceipt) {
-      await client.waitForTransactionReceipt({ hash: txHash, status: "FINALIZED" });
+      receipt = await client.waitForTransactionReceipt({ hash: txHash, status: "FINALIZED" });
     }
   } catch (err) {
     throw new OnchainError(`Transaction ${txHash} did not finalize: ${toMessage(err)}`, err);
   }
 
+  // Resolve the EXACT run_id this transaction assigned, race-free:
+  //   1. Primary - decode it from THIS transaction's own receipt return value.
+  //   2. Fallback - query the contract for this caller's latest run. Keyed by the
+  //      caller's own address, so an interleaved evaluate() from another caller
+  //      cannot make it resolve someone else's run. Either way we NEVER guess
+  //      from the shared counter.
+  let runId = extractRunIdFromReceipt(receipt);
+  if (!runId) {
+    try {
+      const raw = await client.readContract({
+        address: CONTRACT,
+        functionName: "get_latest_run_id_by_caller",
+        args: [wallet.address],
+      });
+      runId = String(raw);
+    } catch (err) {
+      throw new OnchainError(
+        `Could not resolve the run id for tx ${txHash} (receipt return undecodable and ` +
+          `get_latest_run_id_by_caller failed): ${toMessage(err)}`,
+        err,
+      );
+    }
+  }
+  if (!runId || !RUN_ID_RE.test(runId)) {
+    throw new OnchainError(`Resolved an invalid run id "${runId}" for tx ${txHash}.`);
+  }
+
   // Read back the EXACT run this transaction submitted (transaction-specific),
   // NOT the global latest record which could belong to another submission.
-  const runId = `run_${countBefore}`;
   let record: unknown;
   try {
     record = await client.readContract({

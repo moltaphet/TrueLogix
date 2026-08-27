@@ -368,3 +368,54 @@ def test_get_run_unknown_reverts(direct_vm, direct_deploy, direct_alice):
     direct_vm.sender = direct_alice
     with direct_vm.expect_revert("unknown run_id"):
         contract.get_run("run_999")
+
+
+# --------------------------------------------------------------------------- #
+# 10. Race-free exact readback: resolve a caller's exact run by address        #
+#     (no pre-read of the shared counter), even when another caller interleaves #
+# --------------------------------------------------------------------------- #
+def test_latest_run_by_caller_is_exact_and_race_free(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
+    contract = direct_deploy(CONTRACT)
+    mock_all(direct_vm)
+
+    # Alice submits run_0. Her caller address is recorded in the run under
+    # "requested_by" (the exact string the contract keys the caller index by).
+    direct_vm.sender = direct_alice
+    alice_run = _run(contract)["run_id"]
+    assert alice_run == "run_0"
+    alice_addr = json.loads(contract.get_run("run_0"))["requested_by"]
+
+    # Bob interleaves and submits run_1, advancing the shared counter. A frontend
+    # that had pre-read the counter as 0 for Alice would now mis-fetch run_1.
+    direct_vm.sender = direct_bob
+    bob_run = _run(contract)["run_id"]
+    assert bob_run == "run_1"
+    bob_addr = json.loads(contract.get_run("run_1"))["requested_by"]
+    assert alice_addr != bob_addr
+
+    # Each caller still resolves THEIR OWN exact run purely from their address,
+    # independent of the shared counter's current value.
+    assert contract.get_latest_run_id_by_caller(alice_addr) == "run_0"
+    assert json.loads(contract.get_latest_run_by_caller(alice_addr))["run_id"] == "run_0"
+    assert contract.get_latest_run_id_by_caller(bob_addr) == "run_1"
+    assert json.loads(contract.get_latest_run_by_caller(bob_addr))["run_id"] == "run_1"
+
+
+def test_latest_run_by_caller_is_case_insensitive(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    mock_all(direct_vm)
+    _run(contract)
+
+    addr = json.loads(contract.get_run("run_0"))["requested_by"]
+    assert contract.get_latest_run_id_by_caller(addr.upper()) == "run_0"
+    assert contract.get_latest_run_id_by_caller(addr.lower()) == "run_0"
+
+
+def test_latest_run_by_caller_unknown_reverts(direct_vm, direct_deploy, direct_alice):
+    contract = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("no runs recorded for caller"):
+        contract.get_latest_run_id_by_caller("0x000000000000000000000000000000000000dead")

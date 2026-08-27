@@ -447,6 +447,15 @@ def _key_c(env: dict):
 # 5. LEADER-ERROR HANDLING FOR VALIDATORS
 # ===========================================================================
 
+def _normalize_caller(addr: str) -> str:
+    """
+    Normalize a caller address for use as a lookup key. Hex addresses are
+    lowercased so lookups are case-insensitive (wallets may return checksummed or
+    lowercase hex for the same account).
+    """
+    return addr.strip().lower()
+
+
 def _handle_leader_error(leaders_res, leader_fn) -> bool:
     leader_msg = getattr(leaders_res, "message", "") or ""
     try:
@@ -475,6 +484,12 @@ class TrueLogixConsensus(gl.Contract):
     records: TreeMap[str, str]
     # append-only compact index for enumeration
     history: DynArray[str]
+    # caller address (lowercase hex) -> that caller's most recently assigned run_id.
+    # This lets a frontend fetch the EXACT run its own transaction produced without
+    # ever pre-reading (and racing on) the shared run_count. An interleaved
+    # evaluate() from another caller cannot corrupt this lookup because it is keyed
+    # by the caller's own address, not by the global counter.
+    latest_run_by_caller: TreeMap[str, str]
 
     def __init__(self):
         self.owner = gl.message.sender_address
@@ -568,8 +583,11 @@ class TrueLogixConsensus(gl.Contract):
         ))
 
         # Derive a deterministic run_id from the persisted counter (no randomness).
+        # The counter is only advanced here, atomically inside this transaction, so
+        # the run_id assigned below is unambiguously THIS transaction's run_id.
         run_id = "run_" + str(int(self.run_count))
         self.run_count = u256(int(self.run_count) + 1)
+        caller_key = self._caller_key()
 
         c_payload = envelope_c.get("payload", {})
         final_decision = c_payload.get("final_decision", "escalate")
@@ -589,7 +607,13 @@ class TrueLogixConsensus(gl.Contract):
         record_json = json.dumps(record, sort_keys=True, ensure_ascii=False)
         self.records[run_id] = record_json
         self.history.append(run_id)
+        # Record this caller's most recent run so the frontend can resolve the
+        # exact run by caller address (race-free) instead of guessing from a
+        # pre-read of the shared counter.
+        self.latest_run_by_caller[caller_key] = run_id
 
+        # The assigned run_id is returned so callers that can decode the write
+        # transaction's return value read their exact run directly from the receipt.
         return {
             "run_id": run_id,
             "status": envelope_c.get("status", "error"),
@@ -611,6 +635,27 @@ class TrueLogixConsensus(gl.Contract):
         return self.records[self.history[-1]]
 
     @gl.public.view
+    def get_latest_run_id_by_caller(self, caller: str) -> str:
+        """
+        Return the run_id most recently assigned to `caller`.
+
+        Deterministic and race-free: the lookup is keyed by the caller's own
+        address, so an interleaved evaluate() from a different caller cannot make
+        this return someone else's run. The frontend uses this to fetch the exact
+        run its transaction produced without pre-reading the shared run counter.
+        """
+        key = _normalize_caller(caller)
+        if key not in self.latest_run_by_caller:
+            raise gl.vm.UserError(f"{ERROR_EXPECTED} no runs recorded for caller '{caller}'")
+        return self.latest_run_by_caller[key]
+
+    @gl.public.view
+    def get_latest_run_by_caller(self, caller: str) -> str:
+        """Full JSON record for `caller`'s most recent run (see get_latest_run_id_by_caller)."""
+        run_id = self.get_latest_run_id_by_caller(caller)
+        return self.records[run_id]
+
+    @gl.public.view
     def get_run_count(self) -> int:
         return int(self.run_count)
 
@@ -620,3 +665,6 @@ class TrueLogixConsensus(gl.Contract):
             return gl.message.sender_address.as_hex
         except Exception:
             return str(gl.message.sender_address)
+
+    def _caller_key(self) -> str:
+        return _normalize_caller(self._sender_str())
