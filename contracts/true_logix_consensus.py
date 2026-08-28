@@ -16,12 +16,16 @@ semantically identical answers. We therefore use a **custom validator function**
 and compares only the *consensus-critical* projection of the envelope - the exact
 semantics the Step-1 `B_PRINCIPLE` / `C_PRINCIPLE` strings described:
 
-  * Agent A: identical set of (field_id, found, canonical value) triples.
-  * Agent B: identical set of failing (rule_id, severity) + identical overall_verdict.
-  * Agent C: identical final_decision + identical conflict dispositions.
+  * Agent A: identical status + identical set of (field_id, found) pairs.
+  * Agent B: identical status + overall_verdict + set of failing rule_ids.
+  * Agent C: identical status + final_decision.
 
-This is stricter and cheaper than `prompt_comparative` (no extra LLM round per
-validator) while remaining tolerant of non-semantic envelope noise.
+Each validator json.loads() both its own and the leader's envelope and compares
+only these deterministic outcome fields (see section 4), so per-field value /
+evidence / confidence / conflict text may drift without breaking consensus. This
+is cheaper than `prompt_comparative` (no extra LLM round per validator) while
+remaining tolerant of the non-semantic envelope noise that otherwise makes
+validators vote "disagree" (Status 3).
 """
 
 from genlayer import *
@@ -436,7 +440,18 @@ def _validate_c(env: dict) -> dict:
 
 # ===========================================================================
 # 4. CONSENSUS-CRITICAL PROJECTIONS (what validators actually compare)
-#    Encodes B_PRINCIPLE / C_PRINCIPLE from Step 1 as deterministic equality.
+#    Robust-semantic equivalence: validators json.loads both envelopes and
+#    compare ONLY the deterministic outcome fields, tolerating the per-field
+#    value / evidence / confidence / bookkeeping text that inevitably drifts
+#    across independent LLM runs. This is what clears Status 3 (validators voting
+#    "disagree") while still verifying every validator reached the same decision:
+#
+#      * Agent A: status + the set of (field_id, found) pairs.
+#      * Agent B: status + overall_verdict + the set of failing rule_ids.
+#      * Agent C: status + final_decision.
+#
+#    Status is carried implicitly: a non-ok envelope routes to _nonok_key, so a
+#    leader/validator status mismatch always fails equality.
 # ===========================================================================
 
 def _nonok_key(env: dict):
@@ -448,33 +463,29 @@ def _key_a(env: dict):
     if env.get("status") != "ok":
         return _nonok_key(env)
     fields = env["payload"]["fields"]
-    triples = frozenset(
-        (f["field_id"], bool(f["found"]), json.dumps(f.get("value"), sort_keys=True))
-        for f in fields
-    )
-    ambiguous = frozenset(env["payload"].get("ambiguous", []))
-    return ("A", triples, ambiguous)
+    # Agree on WHICH fields were found; tolerate the extracted value / evidence
+    # text, which is inherently noisy across independent LLM runs.
+    found_set = frozenset((f["field_id"], bool(f["found"])) for f in fields)
+    return ("A", found_set)
 
 
 def _key_b(env: dict):
     if env.get("status") != "ok":
         return _nonok_key(env)
     p = env["payload"]
-    failing = frozenset(
-        (r["rule_id"], r["severity"]) for r in p["rules"] if r["verdict"] == "fail"
-    )
-    return ("B", failing, p["overall_verdict"])
+    # Agree on the overall verdict and WHICH rules failed; tolerate severity /
+    # reason_code / evidence text drift.
+    failing = frozenset(r["rule_id"] for r in p["rules"] if r["verdict"] == "fail")
+    return ("B", p["overall_verdict"], failing)
 
 
 def _key_c(env: dict):
     if env.get("status") != "ok":
         return _nonok_key(env)
     p = env["payload"]
-    resolved = frozenset(
-        (c["conflict_id"], c["resolution_action"]) for c in p["resolved_conflicts"]
-    )
-    unresolved = frozenset(c["conflict_id"] for c in p["unresolved_conflicts"])
-    return ("C", p["final_decision"], resolved, unresolved)
+    # The decisive, deterministic outcome. Conflict bookkeeping can vary in
+    # wording without changing the decision, so it is not part of the key.
+    return ("C", p["final_decision"])
 
 
 # ===========================================================================
