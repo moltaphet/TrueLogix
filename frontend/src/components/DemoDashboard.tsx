@@ -1,7 +1,7 @@
 import { useState } from "react";
 import ConduitDiagram from "./ConduitDiagram";
 import { AGENT_META, JsonView, Reveal } from "./primitives";
-import { runConsensus, VALIDATOR_COUNT } from "../lib/consensus";
+import { runConsensus } from "../lib/consensus";
 import { canRunOnchain } from "../lib/genlayer";
 import { useWallet, shortAddress } from "../lib/wallet";
 import { PRESETS } from "../lib/sampleData";
@@ -11,20 +11,18 @@ import type {
   ConsensusInput,
   EnvelopeC,
   FinalDecision,
-  QuorumVote,
   StagePhase,
 } from "../types";
 
 interface StageState {
   phase: StagePhase;
   envelope?: AnyEnvelope;
-  votes: QuorumVote[];
 }
 
 const EMPTY: Record<AgentId, StageState> = {
-  A: { phase: "idle", votes: [] },
-  B: { phase: "idle", votes: [] },
-  C: { phase: "idle", votes: [] },
+  A: { phase: "idle" },
+  B: { phase: "idle" },
+  C: { phase: "idle" },
 };
 
 const DECISION_STYLE: Record<FinalDecision, { label: string; color: string; note: string }> = {
@@ -70,7 +68,7 @@ export default function DemoDashboard() {
         if (ev.phase === "running") setActive(ev.agent);
         setStages((prev) => ({
           ...prev,
-          [ev.agent]: { phase: ev.phase, envelope: ev.envelope ?? prev[ev.agent].envelope, votes: ev.votes ?? prev[ev.agent].votes },
+          [ev.agent]: { phase: ev.phase, envelope: ev.envelope ?? prev[ev.agent].envelope },
         }));
         if (ev.agent === "C" && (ev.phase === "done" || ev.phase === "error") && ev.envelope) {
           setFinal(ev.envelope as EnvelopeC);
@@ -222,7 +220,7 @@ function Field({ label, hint, children }: { label: string; hint: string; childre
 
 function AgentColumn({ agent, state }: { agent: AgentId; state: StageState }) {
   const meta = AGENT_META[agent];
-  const { phase, envelope, votes } = state;
+  const { phase, envelope } = state;
   const running = phase === "running";
   const showEnvelope = (phase === "voting" || phase === "done" || phase === "error") && envelope;
 
@@ -244,9 +242,7 @@ function AgentColumn({ agent, state }: { agent: AgentId; state: StageState }) {
         </span>
       </div>
 
-      {votes.length > 0 && <QuorumStrip votes={votes} />}
-
-      <div className={`min-h-[288px] ${votes.length > 0 ? "mt-3.5" : ""}`}>
+      <div className="min-h-[288px]">
         {running && <Skeleton color={meta.color} />}
         {showEnvelope && <JsonView value={envelope} className="h-[288px]" />}
         {phase === "idle" && (
@@ -255,37 +251,6 @@ function AgentColumn({ agent, state }: { agent: AgentId; state: StageState }) {
           </div>
         )}
       </div>
-    </div>
-  );
-}
-
-// NOTE: This quorum strip is an ILLUSTRATIVE UI animation, not live validator
-// data. The deployed contract returns an already-agreed result per stage, not a
-// per-validator vote tally, so the dots below are simulated for visualization
-// and are explicitly labelled as such so they are not read as on-chain votes.
-function QuorumStrip({ votes }: { votes: QuorumVote[] }) {
-  const agree = votes.filter((v) => v.agree).length;
-  return (
-    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-      <div className="flex gap-1">
-        {votes.map((v, i) => (
-          <span
-            key={i}
-            className="inline-block h-2.5 w-2.5 animate-blip rounded-[3px]"
-            style={{ background: v.agree ? "#34D399" : "#FB7185", animationDelay: `${i * 70}ms` }}
-            title="Simulated UI — not live validator data"
-          />
-        ))}
-      </div>
-      <span className="font-mono text-[10px] text-fog">
-        {agree}/{VALIDATOR_COUNT} agree
-      </span>
-      <span
-        className="rounded border border-line/70 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-wide text-fog/80"
-        title="This quorum strip is a UI illustration, not on-chain validator votes."
-      >
-        Simulated UI · not live validator data
-      </span>
     </div>
   );
 }

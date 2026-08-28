@@ -75,16 +75,11 @@ export interface ConsensusInput {
 
 export type StagePhase = "idle" | "running" | "voting" | "done" | "error";
 
-export interface QuorumVote {
-  agree: boolean;
-}
-
 // A single event streamed from the consensus runner as the pipeline advances.
 export interface StageEvent {
   agent: AgentId;
   phase: StagePhase;
   envelope?: AnyEnvelope;
-  votes?: QuorumVote[]; // validator quorum for this stage
   error?: string;
   mode: "simulation" | "onchain";
 }

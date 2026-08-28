@@ -6,22 +6,11 @@
 // NOT silently swap in the client-side simulator. The simulator is used only as
 // an explicit mode when no contract/wallet is configured.
 
-import type { ConsensusInput, StageEvent, AgentId, QuorumVote } from "../types";
+import type { ConsensusInput, StageEvent, AgentId } from "../types";
 import { runAgentA, runAgentB, runAgentC } from "./simulator";
 import { evaluateOnchain, canRunOnchain, type WalletHandle } from "./genlayer";
 
-// Number of validators the deployed contract re-runs each stage across. Used
-// only to size the ILLUSTRATIVE quorum visualization below — this is not live
-// per-validator vote data (the contract returns an agreed result, not a tally).
-export const VALIDATOR_COUNT = 5;
-
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Synthetic quorum strip for the UI animation. This is a fixed illustration of a
-// healthy consensus, NOT a live count of validator votes returned by the chain.
-function quorum(agree: boolean): QuorumVote[] {
-  return Array.from({ length: VALIDATOR_COUNT }, () => ({ agree }));
-}
 
 export interface RunOptions {
   // Per-stage pacing for the animation (ms). Set 0 for instant.
@@ -60,7 +49,7 @@ export async function* runConsensus(
     await sleep(stageDelay);
 
     const env = envelopes[agent];
-    yield { agent, phase: "voting", envelope: env, votes: quorum(true), mode: onchain ? "onchain" : "simulation" };
+    yield { agent, phase: "voting", envelope: env, mode: onchain ? "onchain" : "simulation" };
     await sleep(voteDelay);
 
     const healthy = env.status === "ok";
@@ -68,7 +57,6 @@ export async function* runConsensus(
       agent,
       phase: healthy ? "done" : "error",
       envelope: env,
-      votes: quorum(true),
       error: healthy ? undefined : "stage returned non-ok status",
       mode: onchain ? "onchain" : "simulation",
     };

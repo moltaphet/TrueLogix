@@ -1,6 +1,6 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 """
-TrueLogix — Multi-Agent Consensus Orchestrator (Step 2)
+TrueLogix - Multi-Agent Consensus Orchestrator (Step 2)
 
 Wires the Step-1 agent prompts (TrueLogix/agents/*.md) into GenLayer `gl.nondet`
 execution blocks and orchestrates the A -> B -> C pipeline inside a single write
@@ -13,7 +13,7 @@ guidance, `strict_eq` on an LLM call is an anti-pattern: LLM output is not
 byte-reproducible across validators, so `strict_eq` would fail consensus even on
 semantically identical answers. We therefore use a **custom validator function**
 (`gl.vm.run_nondet_unsafe`) for every agent. Each validator re-executes the leader
-and compares only the *consensus-critical* projection of the envelope — the exact
+and compares only the *consensus-critical* projection of the envelope - the exact
 semantics the Step-1 `B_PRINCIPLE` / `C_PRINCIPLE` strings described:
 
   * Agent A: identical set of (field_id, found, canonical value) triples.
@@ -34,10 +34,10 @@ import re
 # Validators use these to decide whether a failure is deterministic (must match)
 # or non-deterministic (agree/rotate).
 # ---------------------------------------------------------------------------
-ERROR_EXPECTED = "[EXPECTED]"    # business/validation logic — exact match required
-ERROR_EXTERNAL = "[EXTERNAL]"    # deterministic external failure — exact match
-ERROR_TRANSIENT = "[TRANSIENT]"  # network/5xx — agree if both transient
-ERROR_LLM = "[LLM_ERROR]"        # malformed/invalid LLM output — force rotation
+ERROR_EXPECTED = "[EXPECTED]"    # business/validation logic - exact match required
+ERROR_EXTERNAL = "[EXTERNAL]"    # deterministic external failure - exact match
+ERROR_TRANSIENT = "[TRANSIENT]"  # network/5xx - agree if both transient
+ERROR_LLM = "[LLM_ERROR]"        # malformed/invalid LLM output - force rotation
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -56,7 +56,7 @@ C_RESOLUTION_SET = {
 
 
 # ===========================================================================
-# 1. PROMPTS — runtime-canonical extraction of TrueLogix/agents/*.md
+# 1. PROMPTS - runtime-canonical extraction of TrueLogix/agents/*.md
 #    (the markdown files are the human spec; these constants are what the
 #    contract actually loads/interpolates at execution time)
 # ===========================================================================
@@ -211,7 +211,7 @@ def build_prompt_b(payload_a: dict, rule_set: str, constraints: str) -> str:
     return _assemble_prompt(
         AGENT_B_SYSTEM,
         [
-            f"PAYLOAD_A:\n{json.dumps(payload_a, sort_keys=True, ensure_ascii=False)}",
+            f"PAYLOAD_A:\n{_canonical_json(payload_a)}",
             f"RULE_SET:\n{rule_set}",
             f"CONSTRAINTS:\n{constraints}",
         ],
@@ -222,15 +222,49 @@ def build_prompt_c(envelope_a: dict, envelope_b: dict, policy: str) -> str:
     return _assemble_prompt(
         AGENT_C_SYSTEM,
         [
-            f"ENVELOPE_A:\n{json.dumps(envelope_a, sort_keys=True, ensure_ascii=False)}",
-            f"ENVELOPE_B:\n{json.dumps(envelope_b, sort_keys=True, ensure_ascii=False)}",
+            f"ENVELOPE_A:\n{_canonical_json(envelope_a)}",
+            f"ENVELOPE_B:\n{_canonical_json(envelope_b)}",
             f"POLICY:\n{policy}",
         ],
     )
 
 
 # ===========================================================================
-# 2. JSON PARSING SAFEGUARDS
+# 2. STRICT CANONICAL SERIALIZATION (consensus determinism)
+#    LLMs emit object keys AND array elements in arbitrary order, and that order
+#    differs from one validator to the next. json.dumps(sort_keys=True) fixes the
+#    key order but NOT the array element order, so two validators can serialize
+#    the exact same semantic envelope into two different byte strings. That byte
+#    drift is what leaves execution stuck in COMMITTING with leader rotation.
+#
+#    _canonicalize recursively rewrites the object into an order-independent form:
+#    dict keys are sorted by json.dumps(sort_keys=True); list elements are sorted
+#    by their own canonical serialization. After this, ALL validators dump the
+#    identical deterministic byte string and reach consensus instantly.
+# ===========================================================================
+
+def _canonicalize(obj):
+    """Return an order-independent copy of `obj`: every list is sorted by each
+    element's own canonical form so array ordering cannot vary across validators.
+    Dict key ordering is handled by json.dumps(sort_keys=True) at dump time."""
+    if isinstance(obj, dict):
+        return {k: _canonicalize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        items = [_canonicalize(v) for v in obj]
+        return sorted(items, key=lambda v: json.dumps(v, sort_keys=True, ensure_ascii=False))
+    return obj
+
+
+def _canonical_json(obj) -> str:
+    """Serialize `obj` to the single deterministic byte string every validator
+    must agree on: object keys lexicographically sorted AND array elements sorted
+    into a canonical order. Use this for anything returned from or persisted by
+    the contract so consensus is byte-for-byte reproducible."""
+    return json.dumps(_canonicalize(obj), sort_keys=True, ensure_ascii=False)
+
+
+# ===========================================================================
+# 2b. JSON PARSING SAFEGUARDS
 # ===========================================================================
 
 def _coerce_to_dict(raw) -> dict:
@@ -519,7 +553,10 @@ class TrueLogixConsensus(gl.Contract):
                 raw = raw.get()
             env = _coerce_to_dict(raw)
             validate_fn(env)
-            return json.dumps(env, sort_keys=True, ensure_ascii=False)
+            # Emit the strict canonical byte string (keys AND array elements
+            # sorted) so every validator returns the identical bytes for a
+            # semantically identical envelope -> instant consensus, no rotation.
+            return _canonical_json(env)
 
         def validator_fn(leaders_res: gl.vm.Result) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
@@ -561,21 +598,21 @@ class TrueLogixConsensus(gl.Contract):
         if not isinstance(rule_set, str) or rule_set.strip() == "":
             raise gl.vm.UserError(f"{ERROR_EXPECTED} rule_set must be a non-empty string")
 
-        # Stage A — extract & verify facts. Each stage returns canonical JSON.
+        # Stage A - extract & verify facts. Each stage returns canonical JSON.
         envelope_a = json.loads(self._run_agent(
             build_prompt_a(source_material, extraction_schema),
             _validate_a,
             _key_a,
         ))
 
-        # Stage B — audit A's facts against the rules.
+        # Stage B - audit A's facts against the rules.
         envelope_b = json.loads(self._run_agent(
             build_prompt_b(envelope_a.get("payload", {}), rule_set, constraints),
             _validate_b,
             _key_b,
         ))
 
-        # Stage C — synthesize the final decision from A and B.
+        # Stage C - synthesize the final decision from A and B.
         envelope_c = json.loads(self._run_agent(
             build_prompt_c(envelope_a, envelope_b, policy),
             _validate_c,
@@ -604,7 +641,7 @@ class TrueLogixConsensus(gl.Contract):
             "envelope_c": envelope_c,
             "requested_by": self._sender_str(),
         }
-        record_json = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        record_json = _canonical_json(record)
         self.records[run_id] = record_json
         self.history.append(run_id)
         # Record this caller's most recent run so the frontend can resolve the
