@@ -97,7 +97,20 @@ export function Section({
 
 /** Minimal JSON pretty-printer with token highlighting. */
 export function JsonView({ value, className = "" }: { value: unknown; className?: string }) {
-  const text = JSON.stringify(value, null, 2);
+  // Be resilient to the contract handing back stringified JSON (the strict
+  // determinism fixes serialize envelopes with json.dumps): parse a JSON string
+  // back into an object so it pretty-prints instead of showing a quoted blob.
+  // Never crash on undefined/null - show a small placeholder instead.
+  let rendered: unknown = value;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    try {
+      rendered = trimmed === "" ? null : JSON.parse(trimmed);
+    } catch {
+      rendered = value; // not JSON - display the raw string as-is
+    }
+  }
+  const text = rendered === undefined || rendered === null ? "// no data" : JSON.stringify(rendered, null, 2);
   return (
     <pre
       className={`scroll-slim overflow-auto rounded-xl border border-line bg-ink-950/80 px-4 py-3.5 font-mono text-[12px] leading-[1.75] [tab-size:2] ${className}`}

@@ -69,6 +69,36 @@ function resolveChain(): any {
   return chain;
 }
 
+/**
+ * Coerce a contract return value into a native JS value.
+ *
+ * The strict-determinism fixes made the contract serialize the run record - and
+ * the A/B/C agent envelopes nested inside it - with json.dumps, so a view like
+ * get_run hands back a JSON *string* instead of a decoded object. Some
+ * genlayer-js / network combinations may also deliver a value already decoded.
+ * This parses strings back into objects and leaves values that are already
+ * objects untouched, so the UI always receives real objects to render.
+ *
+ * Returns undefined for null / empty / unparseable input so callers can render
+ * a graceful empty state instead of crashing.
+ */
+function parseMaybeJson<T = unknown>(value: unknown): T | undefined {
+  if (value === null || value === undefined) return undefined;
+  // Already a decoded object/array - nothing to parse.
+  if (typeof value === "object") return value as T;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") return undefined;
+    try {
+      return JSON.parse(trimmed) as T;
+    } catch {
+      return undefined;
+    }
+  }
+  // numbers / booleans: no JSON to parse, hand back as-is.
+  return value as T;
+}
+
 function toMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === "string") return err;
@@ -230,21 +260,34 @@ export async function evaluateOnchain(
     throw new OnchainError(`Failed to read back run ${runId} (tx ${txHash}): ${toMessage(err)}`, err);
   }
 
-  let parsed: any;
-  try {
-    parsed = typeof record === "string" ? JSON.parse(record) : record;
-  } catch (err) {
-    throw new OnchainError(`Malformed record for ${runId}: ${toMessage(err)}`, err);
+  // get_run returns the whole record as a json.dumps string. Parse the record,
+  // then parse each nested envelope defensively: depending on the SDK / network
+  // an envelope may arrive as a nested object OR as a re-stringified JSON blob.
+  // parseMaybeJson handles both and never throws.
+  const parsed = parseMaybeJson<any>(record) ?? {};
+
+  const a = parseMaybeJson<EnvelopeA>(parsed.envelope_a);
+  const b = parseMaybeJson<EnvelopeB>(parsed.envelope_b);
+  const c = parseMaybeJson<EnvelopeC>(parsed.envelope_c);
+
+  // If the record could not be parsed into the three agent envelopes at all, the
+  // return shape is genuinely unexpected - surface the real record rather than
+  // silently render three blank boxes.
+  if (!a && !b && !c) {
+    const preview = typeof record === "string" ? record.slice(0, 200) : `${typeof record}`;
+    throw new OnchainError(
+      `Run ${runId} (tx ${txHash}) returned no decodable agent envelopes. Raw record: ${preview}`,
+    );
   }
 
   return {
     run_id: parsed.run_id ?? runId,
     tx_hash: txHash,
-    status: parsed.status,
-    final_decision: parsed.final_decision,
-    combined_confidence: String(parsed.combined_confidence),
-    a: parsed.envelope_a,
-    b: parsed.envelope_b,
-    c: parsed.envelope_c,
+    status: parsed.status ?? c?.status ?? "error",
+    final_decision: parsed.final_decision ?? c?.payload?.final_decision ?? "escalate",
+    combined_confidence: String(parsed.combined_confidence ?? c?.payload?.combined_confidence ?? "0.00"),
+    a: a as EnvelopeA,
+    b: b as EnvelopeB,
+    c: c as EnvelopeC,
   };
 }

@@ -277,8 +277,29 @@ function ErrorBanner({ message }: { message: string }) {
   );
 }
 
+// Parse a value that may already be an object or may be a JSON string, without
+// ever throwing. Returns an empty object on null / unparseable input so callers
+// can safely read (and default) individual fields.
+function safeParse<T>(value: unknown): T {
+  if (value && typeof value === "object") return value as T;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return {} as T;
+    }
+  }
+  return {} as T;
+}
+
 function DecisionCard({ env }: { env: EnvelopeC }) {
-  const d = DECISION_STYLE[env.payload.final_decision];
+  // Tolerate an envelope that arrived stringified or partially shaped so the
+  // decision card never crashes on an undefined payload / unknown decision.
+  const parsed: EnvelopeC =
+    typeof env === "string" ? safeParse<EnvelopeC>(env) : env;
+  const payload = parsed?.payload ?? ({} as EnvelopeC["payload"]);
+  const decision = payload.final_decision ?? "escalate";
+  const d = DECISION_STYLE[decision] ?? DECISION_STYLE.escalate;
   return (
     <div className="panel overflow-hidden p-0" style={{ borderColor: d.color + "55" }}>
       <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between">
@@ -287,7 +308,7 @@ function DecisionCard({ env }: { env: EnvelopeC }) {
             className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl font-display text-xl font-bold"
             style={{ background: d.color + "1f", color: d.color, boxShadow: `0 0 0 1px ${d.color}55` }}
           >
-            {env.payload.final_decision === "approve" ? "✓" : env.payload.final_decision === "reject" ? "✕" : "!"}
+            {decision === "approve" ? "✓" : decision === "reject" ? "✕" : "!"}
           </div>
           <div>
             <div className="font-mono text-[11px] uppercase tracking-kicker text-fog">final decision</div>
@@ -298,10 +319,10 @@ function DecisionCard({ env }: { env: EnvelopeC }) {
           </div>
         </div>
         <div className="flex shrink-0 gap-6 sm:flex-col sm:gap-2 sm:text-right">
-          <Metric label="combined confidence" value={env.payload.combined_confidence} />
+          <Metric label="combined confidence" value={payload.combined_confidence ?? "0.00"} />
           <Metric
             label="rationale"
-            value={env.payload.rationale_codes[0] ?? "—"}
+            value={payload.rationale_codes?.[0] ?? "-"}
             mono
           />
         </div>
