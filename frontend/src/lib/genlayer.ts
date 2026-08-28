@@ -19,6 +19,13 @@ import type { ConsensusInput, EnvelopeA, EnvelopeB, EnvelopeC } from "../types";
 const CONTRACT = import.meta.env.VITE_GENLAYER_CONTRACT as string | undefined;
 const NETWORK = (import.meta.env.VITE_GENLAYER_NETWORK as string | undefined) ?? "studionet";
 
+// Patient polling for the write receipt. genlayer-js waits interval*retries total
+// before giving up; we give it ~180s so a slow block can never crash the UI while
+// the network works toward consensus. See the wait call for why we target
+// ACCEPTED (a decided state) rather than FINALIZED.
+const RECEIPT_POLL_INTERVAL_MS = 5000;
+const RECEIPT_POLL_RETRIES = 36; // 5s * 36 = 180s of patience
+
 // Minimal shape of an injected EIP-1193 provider (e.g. MetaMask).
 interface Eip1193Provider {
   request(args: { method: string; params?: unknown[] | object }): Promise<unknown>;
@@ -210,14 +217,32 @@ export async function evaluateOnchain(
     throw new OnchainError(`Contract evaluate() reverted: ${toMessage(err)}`, err);
   }
 
-  // Wait for THIS specific transaction to finalize before reading its result.
+  // Wait, patiently, for THIS transaction to reach a DECIDED state before reading
+  // its result.
+  //
+  // We target ACCEPTED, NOT FINALIZED, on purpose. In genlayer-js,
+  // waitForTransactionReceipt only takes its "any decided state" shortcut when the
+  // requested status is ACCEPTED; requesting FINALIZED forces it to keep polling
+  // until the (much slower) finalization window elapses. On StudioNet a tx reaches
+  // ACCEPTED (status 5) - consensus done, state committed, the run record already
+  // readable - long before it FINALIZES, so requesting FINALIZED is exactly what
+  // produced "Timed out waiting for transaction ... (current status: 5)". ACCEPTED
+  // is a decided state, so the get_run read below is safe and correct.
+  //
+  // interval*retries (~180s) gives the network ample time so a slow block cannot
+  // crash the UI.
   let receipt: unknown = null;
   try {
     if (client.waitForTransactionReceipt) {
-      receipt = await client.waitForTransactionReceipt({ hash: txHash, status: "FINALIZED" });
+      receipt = await client.waitForTransactionReceipt({
+        hash: txHash,
+        status: "ACCEPTED",
+        interval: RECEIPT_POLL_INTERVAL_MS,
+        retries: RECEIPT_POLL_RETRIES,
+      });
     }
   } catch (err) {
-    throw new OnchainError(`Transaction ${txHash} did not finalize: ${toMessage(err)}`, err);
+    throw new OnchainError(`Transaction ${txHash} did not reach consensus in time: ${toMessage(err)}`, err);
   }
 
   // Resolve the EXACT run_id this transaction assigned, race-free:
