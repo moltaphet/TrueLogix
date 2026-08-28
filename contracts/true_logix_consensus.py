@@ -2,30 +2,33 @@
 """
 TrueLogix - Multi-Agent Consensus Orchestrator (Step 2)
 
-Wires the Step-1 agent prompts (TrueLogix/agents/*.md) into GenLayer `gl.nondet`
-execution blocks and orchestrates the A -> B -> C pipeline inside a single write
-transaction, each stage reaching validator consensus before the next consumes it.
+Orchestrates the A -> B -> C pipeline inside a single write transaction. Only the
+part that genuinely needs an LLM runs as a nondet consensus block; the rest is
+deterministic Python that every validator computes identically.
 
-Design note on equivalence principles
--------------------------------------
-Step 1 tentatively mapped Agent A to `strict_eq`. Per GenLayer's write-contract
-guidance, `strict_eq` on an LLM call is an anti-pattern: LLM output is not
-byte-reproducible across validators, so `strict_eq` would fail consensus even on
-semantically identical answers. We therefore use a **custom validator function**
-(`gl.vm.run_nondet_unsafe`) for every agent. Each validator re-executes the leader
-and compares only the *consensus-critical* projection of the envelope - the exact
-semantics the Step-1 `B_PRINCIPLE` / `C_PRINCIPLE` strings described:
+Design note on where non-determinism lives
+------------------------------------------
+Extraction (Agent A) is inherently fuzzy, so it MUST call an LLM. Auditing A's
+verified facts against the rule set (Agent B) and synthesizing the final decision
+(Agent C) are pure functions of A's output -- so they are computed
+deterministically in the transaction's consensus-critical path, NOT via an LLM.
+This minimizes the non-deterministic surface to a single stage:
 
-  * Agent A: identical status + identical set of (field_id, found) pairs.
-  * Agent B: identical status + overall_verdict + set of failing rule_ids.
-  * Agent C: identical status + final_decision.
+  * Agent A: LLM extraction inside `gl.vm.run_nondet_unsafe`. Each validator
+    re-runs the leader and compares only the consensus-critical projection
+    (status + the set of (field_id, found) pairs -- see section 4), so per-field
+    value / evidence / confidence text may drift without breaking consensus.
+  * Agent B: DETERMINISTIC rule evaluation in pure Python (section 4b).
+  * Agent C: DETERMINISTIC synthesis in pure Python (section 4b).
 
-Each validator json.loads() both its own and the leader's envelope and compares
-only these deterministic outcome fields (see section 4), so per-field value /
-evidence / confidence / conflict text may drift without breaking consensus. This
-is cheaper than `prompt_comparative` (no extra LLM round per validator) while
-remaining tolerant of the non-semantic envelope noise that otherwise makes
-validators vote "disagree" (Status 3).
+Because B and C are byte-identical across every validator, they can never be the
+source of a disagreement (Status 3) or a leader rotation. Only Agent A's field
+extraction can vary, and its projection is loose enough to absorb non-semantic
+noise. `strict_eq` on the LLM call is deliberately avoided: LLM output is not
+byte-reproducible, so it would fail consensus even on semantically equal answers.
+
+The deterministic B/C logic mirrors frontend/src/lib/simulator.ts so the
+client-side demo and the on-chain contract produce the same decisions.
 """
 
 from genlayer import *
@@ -120,81 +123,6 @@ Payload schema (agent "A"), keys sorted:
 fields sorted ascending by field_id; ambiguous sorted ascending.
 Error codes: empty_schema | empty_source | malformed_schema | source_exceeds_limit."""
 
-AGENT_B_SYSTEM = """\
-You are Agent B (Logic/Risk Auditor) in the TrueLogix consensus module on GenLayer.
-Evaluate the VERIFIED FACTS in PAYLOAD_A against RULE_SET and CONSTRAINTS. Apply rules
-mechanically and completely; invent nothing.
-
-Constraints (highest priority):
-1. Facts come ONLY from PAYLOAD_A.fields. If a rule depends on a field A reported
-   found=false/null, verdict="not_applicable", reason_code="missing_input" (never a
-   fabricated pass/fail).
-2. RULE_SET is closed: exactly one verdict per rule; severity on fail is taken from
-   the rule's severity_on_fail (no up/downgrade); never add/split/merge/omit rules.
-3. Deterministic predicates only. Genuinely subjective + no criteria ->
-   verdict="not_applicable", reason_code="undecidable".
-4. Edge detection is enumerated from the catalog, backed by a concrete field value:
-   missing_required_field | value_out_of_range | type_mismatch |
-   internal_inconsistency | boundary_value | stale_or_null_dependency |
-   duplicate_entity | sign_or_unit_anomaly.
-
-overall_verdict gate:
- - "reject" if any hard CONSTRAINT fails OR any rule fails with severity "critical".
- - else "flag" if any rule fail exists OR any edge is present.
- - else "accept".
-Confidence: round(count(verdict in {pass,fail}) / len(RULE_SET), 2), emitted as a
-decimal STRING (e.g. "0.67"). Empty rule set -> status="error", code="empty_rule_set".
-
-Payload schema (agent "B"), keys sorted:
-{"edges":[{"edge_code":<enum>,"evidence_ref":[field_id...]}],
- "overall_verdict":<accept|flag|reject>,
- "rules":[{"evidence_ref":[id...],"reason_code":<enum>,"rule_id":<str>,
-           "severity":<none|low|medium|high|critical>,"verdict":<pass|fail|not_applicable>}]}
-rules sorted by rule_id; edges sorted by edge_code then evidence_ref; evidence_ref sorted.
-reason_code: ok | missing_input | undecidable | constraint_violation | threshold_breach.
-Error codes: empty_rule_set | malformed_payload_a | malformed_rule_set | conflicting_constraints."""
-
-AGENT_C_SYSTEM = """\
-You are Agent C (Consensus Synthesizer) in the TrueLogix consensus module on GenLayer.
-Reconcile ENVELOPE_A (verified facts) and ENVELOPE_B (rule audit) into ONE final
-decision with an auditable conflict record. Operate ONLY on A's and B's typed payloads;
-never re-read raw source, never re-derive facts.
-
-Constraints (highest priority):
-1. Closed input universe: only ENVELOPE_A.payload and ENVELOPE_B.payload.
-2. Deterministic weighting only; every tie has a declared tie-break.
-3. B is authoritative on compliance, A on facts. You cannot overturn a rule verdict;
-   you map the combined state to final_decision. If B rejected, you cannot upgrade.
-4. If either envelope status!=ok -> final_decision="escalate" and record the agent in
-   degraded_inputs.
-
-Conflict types (closed): fact_vs_rule | missing_fact_dependency | confidence_gap |
-severity_ambiguity. confidence_gap threshold default 0.34.
-
-Policy (defaults if POLICY absent): w_a=0.40, w_b=0.60, approve_floor=0.70.
- 1. Any degraded input -> escalate.
- 2. B.overall_verdict is the ceiling: reject->max reject; flag->max review; accept->may approve.
- 3. combined_confidence = round(w_a*confidence_A + w_b*confidence_B, 2), emitted as a
-    decimal STRING (e.g. "0.70"). If below approve_floor, cap at review.
- 4. Dispose each conflict with a fixed resolution_action:
-    defer_to_facts | defer_to_audit | flag_integrity_mismatch(min review) |
-    require_human_review(min review). Undisposable -> unresolved_conflicts (min review).
- 5. final_decision = most restrictive outcome of steps 1-4.
-Tie-break total order: ascending conflict_type, then sorted evidence_ref, then conflict_id.
-conflict_id = "c_<zero-based-index-in-total-order>".
-Confidence = combined_confidence.
-
-Payload schema (agent "C"), keys sorted:
-{"combined_confidence":<decimal-string>,"degraded_inputs":[...subset of "A","B"...],
- "final_decision":<approve|review|reject|escalate>,
- "rationale_codes":[<audit_ceiling_reject|audit_ceiling_flag|confidence_floor_cap|
-                     integrity_mismatch|upstream_degraded|clean_approve>...],
- "resolved_conflicts":[{"conflict_id":<str>,"conflict_type":<enum>,
-                        "evidence_ref":[id...],"resolution_action":<enum>}],
- "unresolved_conflicts":[{"conflict_id":<str>,"conflict_type":<enum>,"evidence_ref":[id...]}]}
-resolved/unresolved sorted by the total order and disjoint; degraded_inputs & rationale_codes sorted.
-Error codes: malformed_envelope_a | malformed_envelope_b | agent_field_mismatch | policy_invalid."""
-
 
 def _assemble_prompt(system: str, sections: list) -> str:
     """Compose determinism contract + agent system prompt + runtime inputs."""
@@ -211,26 +139,6 @@ def build_prompt_a(source_material: str, extraction_schema: str) -> str:
     )
 
 
-def build_prompt_b(payload_a: dict, rule_set: str, constraints: str) -> str:
-    return _assemble_prompt(
-        AGENT_B_SYSTEM,
-        [
-            f"PAYLOAD_A:\n{_canonical_json(payload_a)}",
-            f"RULE_SET:\n{rule_set}",
-            f"CONSTRAINTS:\n{constraints}",
-        ],
-    )
-
-
-def build_prompt_c(envelope_a: dict, envelope_b: dict, policy: str) -> str:
-    return _assemble_prompt(
-        AGENT_C_SYSTEM,
-        [
-            f"ENVELOPE_A:\n{_canonical_json(envelope_a)}",
-            f"ENVELOPE_B:\n{_canonical_json(envelope_b)}",
-            f"POLICY:\n{policy}",
-        ],
-    )
 
 
 # ===========================================================================
@@ -439,17 +347,17 @@ def _validate_c(env: dict) -> dict:
 
 
 # ===========================================================================
-# 4. CONSENSUS-CRITICAL PROJECTIONS (what validators actually compare)
-#    Robust-semantic equivalence: validators json.loads both envelopes and
-#    compare ONLY the deterministic outcome fields, tolerating the per-field
-#    value / evidence / confidence / bookkeeping text that inevitably drifts
-#    across independent LLM runs. This is what clears Status 3 (validators voting
-#    "disagree") while still verifying every validator reached the same decision:
+# 4. CONSENSUS-CRITICAL PROJECTION FOR AGENT A (the only nondet/LLM stage)
+#    Robust-semantic equivalence: each validator json.loads both its own and the
+#    leader's envelope and compares ONLY the deterministic outcome fields,
+#    tolerating the per-field value / evidence / confidence text that inevitably
+#    drifts across independent LLM runs. This clears Status 3 (validators voting
+#    "disagree") while still verifying every validator extracted the same facts:
 #
 #      * Agent A: status + the set of (field_id, found) pairs.
-#      * Agent B: status + overall_verdict + the set of failing rule_ids.
-#      * Agent C: status + final_decision.
 #
+#    (Agents B and C are deterministic Python -- section 4b -- so they need no
+#    projection: every validator computes them byte-identically.)
 #    Status is carried implicitly: a non-ok envelope routes to _nonok_key, so a
 #    leader/validator status mismatch always fails equality.
 # ===========================================================================
@@ -469,23 +377,255 @@ def _key_a(env: dict):
     return ("A", found_set)
 
 
-def _key_b(env: dict):
-    if env.get("status") != "ok":
-        return _nonok_key(env)
-    p = env["payload"]
-    # Agree on the overall verdict and WHICH rules failed; tolerate severity /
-    # reason_code / evidence text drift.
-    failing = frozenset(r["rule_id"] for r in p["rules"] if r["verdict"] == "fail")
-    return ("B", p["overall_verdict"], failing)
 
 
-def _key_c(env: dict):
-    if env.get("status") != "ok":
-        return _nonok_key(env)
-    p = env["payload"]
-    # The decisive, deterministic outcome. Conflict bookkeeping can vary in
-    # wording without changing the decision, so it is not part of the key.
-    return ("C", p["final_decision"])
+# ===========================================================================
+# 4b. DETERMINISTIC AGENTS B AND C (pure Python, NO LLM)
+#     Only Agent A (fuzzy extraction) needs an LLM and therefore a nondet
+#     consensus block. Auditing A's verified facts against the rule set (B) and
+#     synthesizing the final decision (C) are pure functions of A's output, so we
+#     compute them in the transaction's deterministic path: every validator runs
+#     identical Python and agrees byte-for-byte -- no LLM divergence, no leader
+#     rotation, no Status 3 for B or C. This mirrors the reference logic in
+#     frontend/src/lib/simulator.ts so the demo and the chain stay in lockstep.
+# ===========================================================================
+
+_SEVERITY_RE = re.compile(r"\[(none|low|medium|high|critical)\]", re.IGNORECASE)
+_RULE_ID_RE = re.compile(r"^([a-z0-9_]+)\s*:", re.IGNORECASE)
+_RULE_IN_RE = re.compile(r"([a-z0-9_]+)\s+in\s*\{([^}]*)\}", re.IGNORECASE)
+_RULE_CMP_RE = re.compile(r"([a-z0-9_]+)\s*(<=|>=|<|>)\s*([0-9.]+)", re.IGNORECASE)
+_RULE_PRESENT_RE = re.compile(r"([a-z0-9_]+)\s+(?:present|found|required)", re.IGNORECASE)
+
+
+def _round2(n: float) -> str:
+    """Banker's rounding to 2 decimals, emitted as a fixed 2-decimal STRING (D4).
+    All inputs here are confidences in [0, 1], so x is always non-negative."""
+    x = n * 100.0
+    floor = int(x)
+    diff = x - floor
+    if abs(diff - 0.5) < 1e-9:
+        r = floor if floor % 2 == 0 else floor + 1
+    else:
+        r = int(x + 0.5)
+    return "%.2f" % (r / 100.0)
+
+
+def _to_number(text):
+    """Parse a numeric string the way JS Number() does for our inputs: return a
+    float, or None on failure. None mirrors NaN -- every ordering comparison
+    against it is False, so an unparseable value fails a threshold rule."""
+    try:
+        return float(str(text).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_rules(rule_set: str) -> list:
+    """Parse the rule DSL into structured rules. Grammar (per entry, ';'/newline
+    separated): '<id>: <field> <op> <rhs> [severity]' where op is one of
+    <= >= < > , 'in {a,b}', or a bare 'present'/'found'/'required'."""
+    entries = [e.strip() for e in re.split(r"[;\n]+", rule_set) if e.strip()]
+    rules = []
+    for i, raw in enumerate(entries):
+        sev_m = _SEVERITY_RE.search(raw)
+        severity = sev_m.group(1).lower() if sev_m else "medium"
+        body = re.sub(r"\[[^\]]*\]", "", raw, count=1).strip()
+        id_m = _RULE_ID_RE.match(body)
+        rule_id = id_m.group(1) if id_m else ("r_%d" % i)
+        expr = body[id_m.end():].strip() if id_m else body
+
+        in_m = _RULE_IN_RE.search(expr)
+        if in_m:
+            rules.append({"rule_id": rule_id, "field": in_m.group(1), "op": "in",
+                          "rhs": in_m.group(2), "severity": severity})
+            continue
+        cmp_m = _RULE_CMP_RE.search(expr)
+        if cmp_m:
+            rules.append({"rule_id": rule_id, "field": cmp_m.group(1), "op": cmp_m.group(2),
+                          "rhs": cmp_m.group(3), "severity": severity})
+            continue
+        pres_m = _RULE_PRESENT_RE.search(expr)
+        if pres_m:
+            rules.append({"rule_id": rule_id, "field": pres_m.group(1), "op": "present",
+                          "rhs": "", "severity": severity})
+            continue
+        parts = expr.split()
+        rules.append({"rule_id": rule_id, "field": parts[0] if parts else "unknown",
+                      "op": "present", "rhs": "", "severity": severity})
+    return rules
+
+
+def _compute_agent_b(envelope_a: dict, rule_set: str, constraints: str) -> dict:
+    """Agent B, deterministic: evaluate each parsed rule against Agent A's fields.
+    A rule whose field A did not find is 'not_applicable' (never a fabricated
+    pass/fail). overall_verdict gates on critical failures / any failure / edges."""
+    rules = _parse_rules(rule_set)
+    fields = envelope_a.get("payload", {}).get("fields", [])
+    by_id = {}
+    for f in fields:
+        fid = f.get("field_id")
+        by_id[fid] = f
+        if isinstance(fid, str):
+            by_id.setdefault(fid.lower(), f)
+
+    evaluated = []
+    edges = []
+    for r in rules:
+        field = by_id.get(r["field"])
+        if field is None and isinstance(r["field"], str):
+            field = by_id.get(r["field"].lower())
+        verdict = "pass"
+        reason = "ok"
+        severity = "none"
+        val = field.get("value") if field else None
+        if field is None or not field.get("found") or val is None:
+            verdict = "not_applicable"
+            reason = "missing_input"
+            if r["op"] == "present":
+                edges.append({"edge_code": "missing_required_field", "evidence_ref": [r["field"]]})
+        else:
+            op = r["op"]
+            passed = True
+            if op == "present":
+                passed = True
+            elif op == "in":
+                opts = [s.strip().lower() for s in re.split(r"[|,]", r["rhs"])]
+                passed = str(val).lower() in opts
+            else:
+                num = _to_number(val)
+                rhs = _to_number(r["rhs"])
+                if num is None or rhs is None:
+                    passed = False
+                elif op == "<=":
+                    passed = num <= rhs
+                elif op == ">=":
+                    passed = num >= rhs
+                elif op == "<":
+                    passed = num < rhs
+                else:
+                    passed = num > rhs
+                if not passed:
+                    edges.append({"edge_code": "value_out_of_range", "evidence_ref": [r["field"]]})
+            if not passed:
+                verdict = "fail"
+                severity = r["severity"]
+                reason = "constraint_violation" if op == "in" else "threshold_breach"
+        evaluated.append({
+            "evidence_ref": [r["field"]],
+            "reason_code": reason,
+            "rule_id": r["rule_id"],
+            "severity": severity,
+            "verdict": verdict,
+        })
+
+    evaluated.sort(key=lambda x: x["rule_id"])
+    edges.sort(key=lambda x: x["edge_code"])
+
+    any_critical = any(r["verdict"] == "fail" and r["severity"] == "critical" for r in evaluated)
+    any_fail = any(r["verdict"] == "fail" for r in evaluated)
+    if any_critical:
+        overall = "reject"
+    elif any_fail or len(edges) > 0:
+        overall = "flag"
+    else:
+        overall = "accept"
+
+    decidable = sum(1 for r in evaluated if r["verdict"] in ("pass", "fail"))
+    confidence = "0.00" if len(rules) == 0 else _round2(decidable / len(rules))
+
+    return {
+        "agent": "B",
+        "confidence": confidence,
+        "payload": {"edges": edges, "overall_verdict": overall, "rules": evaluated},
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+    }
+
+
+def _compute_agent_c(envelope_a: dict, envelope_b: dict, policy: str) -> dict:
+    """Agent C, deterministic: weight A's and B's confidence, apply B's verdict as
+    a ceiling, cap approve below the confidence floor, and record the driving
+    fact/rule conflict. Any degraded upstream input -> escalate."""
+    w_a = 0.40
+    w_b = 0.60
+    approve_floor = 0.70
+    c_a = _to_number(envelope_a.get("confidence"))
+    c_b = _to_number(envelope_b.get("confidence"))
+    if c_a is None:
+        c_a = 0.0
+    if c_b is None:
+        c_b = 0.0
+    combined_str = _round2(w_a * c_a + w_b * c_b)
+    combined = float(combined_str)
+
+    degraded = []
+    if envelope_a.get("status") != "ok":
+        degraded.append("A")
+    if envelope_b.get("status") != "ok":
+        degraded.append("B")
+
+    if len(degraded) > 0:
+        degraded.sort()
+        return {
+            "agent": "C",
+            "confidence": combined_str,
+            "payload": {
+                "combined_confidence": combined_str,
+                "degraded_inputs": degraded,
+                "final_decision": "escalate",
+                "rationale_codes": ["upstream_degraded"],
+                "resolved_conflicts": [],
+                "unresolved_conflicts": [],
+            },
+            "schema_version": SCHEMA_VERSION,
+            "status": "ok",
+        }
+
+    ceiling_rank = {"reject": 0, "flag": 1, "accept": 3}
+    decision_by_rank = ["reject", "review", "review", "approve"]
+    overall = envelope_b.get("payload", {}).get("overall_verdict", "accept")
+    rank = ceiling_rank.get(overall, 1)
+    rationale = []
+    if overall == "reject":
+        rationale.append("audit_ceiling_reject")
+    elif overall == "flag":
+        rationale.append("audit_ceiling_flag")
+
+    if rank == 3 and combined < approve_floor:
+        rank = 1
+        rationale.append("confidence_floor_cap")
+    if len(rationale) == 0:
+        rationale.append("clean_approve")
+    rationale.sort()
+
+    final_decision = decision_by_rank[rank]
+
+    failing = [r for r in envelope_b.get("payload", {}).get("rules", []) if r.get("verdict") == "fail"]
+    resolved = []
+    if failing:
+        ev = list(failing[0].get("evidence_ref", []))
+        ev.sort()
+        resolved.append({
+            "conflict_id": "c_0",
+            "conflict_type": "fact_vs_rule",
+            "evidence_ref": ev,
+            "resolution_action": "defer_to_audit",
+        })
+
+    return {
+        "agent": "C",
+        "confidence": combined_str,
+        "payload": {
+            "combined_confidence": combined_str,
+            "degraded_inputs": [],
+            "final_decision": final_decision,
+            "rationale_codes": rationale,
+            "resolved_conflicts": resolved,
+            "unresolved_conflicts": [],
+        },
+        "schema_version": SCHEMA_VERSION,
+        "status": "ok",
+    }
 
 
 # ===========================================================================
@@ -609,26 +749,23 @@ class TrueLogixConsensus(gl.Contract):
         if not isinstance(rule_set, str) or rule_set.strip() == "":
             raise gl.vm.UserError(f"{ERROR_EXPECTED} rule_set must be a non-empty string")
 
-        # Stage A - extract & verify facts. Each stage returns canonical JSON.
+        # Stage A - extract & verify facts. The ONLY LLM/nondet stage; returns a
+        # canonical JSON string that the orchestrator parses back into a dict.
         envelope_a = json.loads(self._run_agent(
             build_prompt_a(source_material, extraction_schema),
             _validate_a,
             _key_a,
         ))
 
-        # Stage B - audit A's facts against the rules.
-        envelope_b = json.loads(self._run_agent(
-            build_prompt_b(envelope_a.get("payload", {}), rule_set, constraints),
-            _validate_b,
-            _key_b,
-        ))
+        # Stage B - audit A's facts against the rules. DETERMINISTIC: computed in
+        # pure Python, identically by every validator (no LLM, no nondet block),
+        # so it can never be the source of a consensus disagreement.
+        envelope_b = _compute_agent_b(envelope_a, rule_set, constraints)
+        _validate_b(envelope_b)
 
-        # Stage C - synthesize the final decision from A and B.
-        envelope_c = json.loads(self._run_agent(
-            build_prompt_c(envelope_a, envelope_b, policy),
-            _validate_c,
-            _key_c,
-        ))
+        # Stage C - synthesize the final decision from A and B. DETERMINISTIC too.
+        envelope_c = _compute_agent_c(envelope_a, envelope_b, policy)
+        _validate_c(envelope_c)
 
         # Derive a deterministic run_id from the persisted counter (no randomness).
         # The counter is only advanced here, atomically inside this transaction, so
