@@ -29,11 +29,76 @@ const RECEIPT_POLL_RETRIES = 36; // 5s * 36 = 180s of patience
 // Minimal shape of an injected EIP-1193 provider (e.g. MetaMask).
 interface Eip1193Provider {
   request(args: { method: string; params?: unknown[] | object }): Promise<unknown>;
+  isMetaMask?: boolean;
+  isPhantom?: boolean;
+  info?: { rdns?: string; name?: string };
 }
 
 export interface WalletHandle {
   provider: Eip1193Provider;
   address: string;
+  // EIP-6963 rdns of the resolved provider, when known ("io.metamask", …). Lets
+  // us distinguish a genuine MetaMask from Phantom/others multiplexed onto the
+  // same window.ethereum before attempting any Snap-based operation.
+  rdns?: string;
+}
+
+// The GenLayer wallet Snap lives inside MetaMask specifically. Phantom (and most
+// other injected wallets) do NOT implement the `wallet_getSnaps` RPC, so probing
+// them for Snaps throws -32601 ("method [wallet_getSnaps] doesn't has
+// corresponding handler"). Verify a provider is *genuinely* MetaMask before any
+// Snap call. rdns (EIP-6963) is the strongest signal; fall back to the legacy
+// `isMetaMask` flag while explicitly rejecting Phantom, which also sets it.
+export function isGenuineMetaMask(
+  provider: Eip1193Provider | null | undefined,
+  rdns?: string,
+): boolean {
+  if (!provider || typeof provider.request !== "function") return false;
+  const resolvedRdns = rdns ?? provider.info?.rdns;
+  if (typeof resolvedRdns === "string") return resolvedRdns === "io.metamask";
+  return provider.isMetaMask === true && provider.isPhantom !== true;
+}
+
+// npm id of the GenLayer wallet Snap (mirrors genlayer-js snapID.npm).
+const GENLAYER_SNAP_ID = "npm:genlayer-wallet-plugin";
+
+/**
+ * Best-effort: make sure the GenLayer Snap is installed in the *given* MetaMask
+ * provider. Every step is wrapped so Snap detection can NEVER crash the app —
+ * this is the exact failure the steward hit (`wallet_getSnaps` -32601 on a
+ * non-MetaMask provider). We deliberately query the provider we resolved rather
+ * than the global window.ethereum, so a Phantom sitting on window.ethereum can't
+ * hijack the probe. Returns true only when the Snap is confirmed present.
+ */
+async function ensureGenLayerSnap(
+  provider: Eip1193Provider,
+  rdns?: string,
+): Promise<boolean> {
+  if (!isGenuineMetaMask(provider, rdns)) return false;
+  try {
+    const installed = (await provider.request({ method: "wallet_getSnaps" })) as
+      | Record<string, { id?: string }>
+      | undefined;
+    const present = installed
+      ? Object.values(installed).some((snap) => snap?.id === GENLAYER_SNAP_ID)
+      : false;
+    if (present) return true;
+    try {
+      await provider.request({
+        method: "wallet_requestSnaps",
+        params: { [GENLAYER_SNAP_ID]: {} },
+      });
+      return true;
+    } catch {
+      // User declined, or install failed — non-fatal. Caller falls back to an
+      // ephemeral signer instead of crashing.
+      return false;
+    }
+  } catch {
+    // Provider doesn't implement wallet_getSnaps (Phantom, etc.) — swallow and
+    // let the caller fall back. Never let this bubble up as a fatal error.
+    return false;
+  }
 }
 
 // Error raised when an on-chain evaluation the user explicitly requested fails.
@@ -50,10 +115,15 @@ export function isOnchainConfigured(): boolean {
   return typeof CONTRACT === "string" && /^0x[0-9a-fA-F]{40}$/.test(CONTRACT);
 }
 
-// On-chain execution needs BOTH a deployed contract address AND a connected
-// wallet to sign the transaction.
-export function canRunOnchain(walletAddress: string | null | undefined): boolean {
-  return isOnchainConfigured() && !!walletAddress;
+// On-chain execution needs a deployed contract address plus a way to sign:
+// either a connected wallet OR an explicit ephemeral "reviewer" account. The
+// reviewer path lets a steward exercise the real contract on StudioNet without
+// any wallet extension (and therefore without any Snap/provider friction).
+export function canRunOnchain(
+  walletAddress: string | null | undefined,
+  reviewer = false,
+): boolean {
+  return isOnchainConfigured() && (!!walletAddress || reviewer);
 }
 
 export interface OnchainResult {
@@ -155,40 +225,81 @@ function extractRunIdFromReceipt(receipt: unknown): string | null {
   return null;
 }
 
+export interface EvaluateOptions {
+  // A connected browser wallet, if any. Only used to sign via MetaMask when the
+  // provider is genuinely MetaMask AND the GenLayer Snap installs cleanly.
+  wallet?: WalletHandle | null;
+  // Force the zero-friction ephemeral reviewer account (createAccount()). Set by
+  // the "Use Ephemeral Reviewer Account" fallback so a steward can exercise the
+  // contract on StudioNet with no wallet extension at all.
+  reviewer?: boolean;
+}
+
 /**
  * Submit source material to the deployed contract's `evaluate` write method,
- * signing with the connected browser wallet, then read back the EXACT run this
- * transaction produced.
+ * then read back the EXACT run this transaction produced.
+ *
+ * Signing strategy (never crashes on provider conflicts):
+ *   - Reviewer mode, or no usable wallet -> sign with a fresh ephemeral local
+ *     account from createAccount(). genlayer-js signs these locally and submits
+ *     via the RPC endpoint, so NO wallet extension / MetaMask Snap is touched.
+ *   - Genuine MetaMask wallet -> attempt to install the GenLayer Snap on that
+ *     specific provider and sign through it. Snap detection is fully defensive:
+ *     if wallet_getSnaps is unsupported (e.g. Phantom multiplexed onto
+ *     window.ethereum) or the user declines, we transparently fall back to the
+ *     ephemeral signer instead of throwing -32601.
  *
  * Race-free by construction: the run_id is resolved AFTER submission from this
- * transaction's own receipt return value (or, as a fallback, a caller-keyed
- * contract query) - never by pre-reading the shared run counter and guessing.
- * An interleaved evaluate() from another caller therefore cannot make us fetch
- * someone else's record.
+ * transaction's own receipt return value (or, as a fallback, a query keyed by
+ * the ACTUAL signer address) - never by pre-reading the shared run counter and
+ * guessing. An interleaved evaluate() from another caller therefore cannot make
+ * us fetch someone else's record.
  *
  * On any SDK / network / contract failure this throws an {@link OnchainError}
  * carrying the underlying message. It never silently falls back to simulation.
  */
 export async function evaluateOnchain(
   input: ConsensusInput,
-  wallet?: WalletHandle | null,
+  options: EvaluateOptions = {},
 ): Promise<OnchainResult> {
   if (!isOnchainConfigured()) {
     throw new OnchainError("No deployed contract configured (VITE_GENLAYER_CONTRACT is unset).");
   }
-  if (!wallet?.address) {
-    throw new OnchainError("Connect a wallet to sign the on-chain evaluate() transaction.");
-  }
 
+  const { wallet, reviewer } = options;
   const chain = resolveChain();
 
-  // Bind a genlayer-js account to the connected EIP-1193 wallet so the tx is
-  // signed by the user's browser wallet (MetaMask Snap flow).
+  // Decide how to sign. Prefer a genuine MetaMask wallet (unless reviewer mode is
+  // forced); otherwise use an ephemeral local account. This is where the reported
+  // crash is neutralised: we only ever touch Snap RPCs on a verified MetaMask
+  // provider, and even then defensively.
   let client: any;
+  let signerAddress: string;
   try {
-    const account = createAccount();
-    client = createClient({ chain, account });
-    if (client.connect) await client.connect();
+    const useWallet =
+      !reviewer && !!wallet?.address && isGenuineMetaMask(wallet.provider, wallet.rdns);
+
+    if (useWallet && wallet) {
+      const snapReady = await ensureGenLayerSnap(wallet.provider, wallet.rdns);
+      if (snapReady) {
+        // Sign through the user's MetaMask: pass the address + the resolved
+        // provider so genlayer-js routes eth_sendTransaction to THIS provider
+        // (not the ambiguous global window.ethereum).
+        client = createClient({ chain, account: wallet.address as any, provider: wallet.provider as any });
+        signerAddress = wallet.address;
+      } else {
+        // Genuine MetaMask but Snap unavailable/declined -> ephemeral fallback.
+        const account = createAccount();
+        client = createClient({ chain, account });
+        signerAddress = account.address;
+      }
+    } else {
+      // Reviewer mode, no wallet, or a non-MetaMask provider (Phantom, etc.):
+      // ephemeral signer, zero wallet friction, zero Snap probing.
+      const account = createAccount();
+      client = createClient({ chain, account });
+      signerAddress = account.address;
+    }
   } catch (err) {
     throw new OnchainError(`Failed to initialize GenLayer client: ${toMessage(err)}`, err);
   }
@@ -257,7 +368,7 @@ export async function evaluateOnchain(
       const raw = await client.readContract({
         address: CONTRACT,
         functionName: "get_latest_run_id_by_caller",
-        args: [wallet.address],
+        args: [signerAddress],
       });
       runId = String(raw);
     } catch (err) {

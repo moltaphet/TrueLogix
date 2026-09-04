@@ -11,6 +11,8 @@ export interface WalletState {
   address: string | null;
   chainId: string | null;
   walletName: string | null;
+  // EIP-6963 rdns of the connected provider ("io.metamask", …), when known.
+  rdns: string | null;
   status: WalletStatus;
   error: string | null;
   provider: Eip1193Provider | null;
@@ -21,27 +23,85 @@ export interface WalletState {
 const WalletContext = createContext<WalletState | null>(null);
 const PERSIST_KEY = "truelogix.wallet.connected";
 
-// Pick the best injected provider: an explicit GenLayer provider first, then
-// MetaMask among multiplexed providers, then any injected wallet.
-function detectProvider(): { provider: Eip1193Provider; name: string } | null {
+const METAMASK_RDNS = "io.metamask";
+const PHANTOM_RDNS = "app.phantom";
+
+// EIP-6963 provider store. Multiple wallets (MetaMask, Phantom, …) each announce
+// their own provider via `eip6963:announceProvider`, so we can select the RIGHT
+// one by rdns instead of gambling on the single, collision-prone window.ethereum.
+// This is what keeps a Phantom sitting on window.ethereum from hijacking flows
+// that must run against MetaMask (e.g. the GenLayer Snap).
+const announcedProviders: EIP6963ProviderDetail[] = [];
+
+if (typeof window !== "undefined") {
+  window.addEventListener("eip6963:announceProvider", (event) => {
+    const detail = (event as EIP6963AnnounceProviderEvent).detail;
+    if (!detail?.info?.uuid || !detail.provider) return;
+    if (!announcedProviders.some((d) => d.info.uuid === detail.info.uuid)) {
+      announcedProviders.push(detail);
+    }
+  });
+  // Ask any already-loaded wallets to (re)announce themselves.
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+}
+
+// Is this a genuine MetaMask (and NOT Phantom impersonating isMetaMask)?
+function providerIsMetaMask(provider: Eip1193Provider | undefined, rdns?: string): boolean {
+  if (!provider) return false;
+  if (rdns) return rdns === METAMASK_RDNS;
+  if (provider.info?.rdns) return provider.info.rdns === METAMASK_RDNS;
+  return provider.isMetaMask === true && provider.isPhantom !== true;
+}
+
+export interface ResolvedProvider {
+  provider: Eip1193Provider;
+  name: string;
+  rdns?: string;
+}
+
+// Pick the best injected provider, preferring an explicit GenLayer provider,
+// then a genuine MetaMask discovered via EIP-6963, then any non-Phantom
+// announced wallet, then legacy window.ethereum detection. Phantom is never
+// selected as "MetaMask" so Snap-based operations can't be routed to it.
+function detectProvider(): ResolvedProvider | null {
   if (typeof window === "undefined") return null;
+
   const gl = window.genlayer;
   if (gl && typeof gl.request === "function") return { provider: gl, name: "GenLayer" };
 
+  // 1. EIP-6963: prefer a genuine MetaMask by rdns.
+  const mm6963 = announcedProviders.find((d) => d.info.rdns === METAMASK_RDNS);
+  if (mm6963) return { provider: mm6963.provider, name: "MetaMask", rdns: mm6963.info.rdns };
+
+  // 2. EIP-6963: any announced wallet that isn't Phantom.
+  const other6963 = announcedProviders.find((d) => d.info.rdns !== PHANTOM_RDNS);
+  if (other6963)
+    return { provider: other6963.provider, name: other6963.info.name || "Wallet", rdns: other6963.info.rdns };
+
+  // 3. Legacy multiplexed window.ethereum.providers array.
   const eth = window.ethereum;
-  if (!eth) return null;
-  if (Array.isArray(eth.providers) && eth.providers.length > 0) {
-    const mm = eth.providers.find((p) => p.isMetaMask);
-    const chosen = mm ?? eth.providers[0];
-    return { provider: chosen, name: mm ? "MetaMask" : "Wallet" };
+  if (!eth) {
+    // Only Phantom announced (no genlayer / non-Phantom / legacy)? Still surface
+    // it so the user isn't stuck — just not tagged as MetaMask.
+    const phantom = announcedProviders.find((d) => d.info.rdns === PHANTOM_RDNS);
+    if (phantom) return { provider: phantom.provider, name: phantom.info.name || "Phantom", rdns: phantom.info.rdns };
+    return null;
   }
-  return { provider: eth, name: eth.isMetaMask ? "MetaMask" : "Wallet" };
+  if (Array.isArray(eth.providers) && eth.providers.length > 0) {
+    const mm = eth.providers.find((p) => providerIsMetaMask(p));
+    const chosen = mm ?? eth.providers.find((p) => p.isPhantom !== true) ?? eth.providers[0];
+    return { provider: chosen, name: providerIsMetaMask(chosen) ? "MetaMask" : "Wallet" };
+  }
+
+  // 4. Single legacy provider.
+  return { provider: eth, name: providerIsMetaMask(eth) ? "MetaMask" : "Wallet" };
 }
 
 export function WalletProvider({ children }: { children: ReactNode }) {
   const [address, setAddress] = useState<string | null>(null);
   const [chainId, setChainId] = useState<string | null>(null);
   const [walletName, setWalletName] = useState<string | null>(null);
+  const [rdns, setRdns] = useState<string | null>(null);
   const [status, setStatus] = useState<WalletStatus>("disconnected");
   const [error, setError] = useState<string | null>(null);
   const providerRef = useRef<Eip1193Provider | null>(null);
@@ -67,6 +127,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
     providerRef.current = injected.provider;
     setWalletName(injected.name);
+    setRdns(injected.rdns ?? null);
     setStatus("connecting");
     setError(null);
     try {
@@ -100,6 +161,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     }
     providerRef.current = injected.provider;
     setWalletName(injected.name);
+    setRdns(injected.rdns ?? null);
 
     const onAccounts = (accounts: string[]) => {
       if (!accounts || accounts.length === 0) disconnect();
@@ -144,6 +206,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     address,
     chainId,
     walletName,
+    rdns,
     status,
     error,
     provider: providerRef.current,

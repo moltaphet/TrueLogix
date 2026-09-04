@@ -2,7 +2,7 @@ import { useState } from "react";
 import ConduitDiagram from "./ConduitDiagram";
 import { AGENT_META, JsonView, Reveal } from "./primitives";
 import { runConsensus } from "../lib/consensus";
-import { canRunOnchain } from "../lib/genlayer";
+import { canRunOnchain, isOnchainConfigured } from "../lib/genlayer";
 import { useWallet, shortAddress } from "../lib/wallet";
 import { PRESETS } from "../lib/sampleData";
 import type {
@@ -40,10 +40,14 @@ export default function DemoDashboard() {
   const [final, setFinal] = useState<EnvelopeC | null>(null);
   const [runId, setRunId] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // Zero-friction reviewer path: run against the real contract with an ephemeral
+  // account (createAccount()) — no wallet extension, no Snap, no provider clash.
+  const [reviewer, setReviewer] = useState(false);
 
   const wallet = useWallet();
   const walletConnected = wallet.status === "connected";
-  const onchain = canRunOnchain(wallet.address); // wallet + deployed contract
+  const contractConfigured = isOnchainConfigured();
+  const onchain = canRunOnchain(wallet.address, reviewer); // (wallet OR reviewer) + deployed contract
 
   const patch = (k: keyof ConsensusInput) => (e: React.ChangeEvent<HTMLTextAreaElement | HTMLInputElement>) =>
     setInput((prev) => ({ ...prev, [k]: e.target.value }));
@@ -59,12 +63,12 @@ export default function DemoDashboard() {
     setRunId(rid);
 
     const walletHandle =
-      onchain && wallet.provider && wallet.address
-        ? { provider: wallet.provider, address: wallet.address }
+      !reviewer && wallet.provider && wallet.address
+        ? { provider: wallet.provider, address: wallet.address, rdns: wallet.rdns ?? undefined }
         : null;
 
     try {
-      for await (const ev of runConsensus(input, { wallet: walletHandle })) {
+      for await (const ev of runConsensus(input, { wallet: walletHandle, reviewer })) {
         if (ev.phase === "running") setActive(ev.agent);
         setStages((prev) => ({
           ...prev,
@@ -103,7 +107,7 @@ export default function DemoDashboard() {
       <Reveal className="panel flex flex-col p-5">
         <div className="mb-4 flex items-center justify-between">
           <span className="kicker">input · raw data</span>
-          <ModeBadge onchain={onchain} walletConnected={walletConnected} />
+          <ModeBadge onchain={onchain} walletConnected={walletConnected} reviewer={reviewer} />
         </div>
 
         <div className="mb-4 flex flex-wrap gap-2">
@@ -145,7 +149,19 @@ export default function DemoDashboard() {
           {!running && <span aria-hidden>→</span>}
         </button>
 
-        {onchain ? (
+        {reviewer ? (
+          <div className="mt-3 space-y-2 text-center">
+            <p className="font-mono text-[11px] leading-relaxed text-verify/90">
+              Reviewer mode — signs evaluate() with an ephemeral account, then reads the stored record. No wallet extension needed.
+            </p>
+            <button
+              onClick={() => setReviewer(false)}
+              className="font-mono text-[11px] text-fog underline decoration-dotted underline-offset-2 transition-colors hover:text-chalk"
+            >
+              Exit reviewer mode
+            </button>
+          </div>
+        ) : onchain ? (
           <p className="mt-3 text-center font-mono text-[11px] leading-relaxed text-verify/90">
             Signs evaluate() with {shortAddress(wallet.address)}, then reads the stored record.
           </p>
@@ -154,13 +170,16 @@ export default function DemoDashboard() {
             Wallet connected. Set a deployed contract address (VITE_GENLAYER_CONTRACT) to submit on-chain — running the simulation meanwhile.
           </p>
         ) : (
-          <button
-            onClick={wallet.connect}
-            className="mt-3 w-full text-center font-mono text-[11px] leading-relaxed text-fog transition-colors hover:text-chalk"
-          >
-            Client-side simulation — no gas needed.{" "}
-            <span className="text-agentA underline decoration-dotted underline-offset-2">Connect a wallet</span> to run on-chain.
-          </button>
+          <div className="mt-3 space-y-2 text-center">
+            <button
+              onClick={wallet.connect}
+              className="w-full font-mono text-[11px] leading-relaxed text-fog transition-colors hover:text-chalk"
+            >
+              Client-side simulation — no gas needed.{" "}
+              <span className="text-agentA underline decoration-dotted underline-offset-2">Connect a wallet</span> to run on-chain.
+            </button>
+            {contractConfigured && <ReviewerFallbackButton onClick={() => setReviewer(true)} />}
+          </div>
         )}
       </Reveal>
 
@@ -176,7 +195,12 @@ export default function DemoDashboard() {
           <ConduitDiagram active={active} completed={completed} locked={locked} />
         </div>
 
-        {error && <ErrorBanner message={error} />}
+        {error && (
+          <ErrorBanner
+            message={error}
+            onUseReviewer={contractConfigured && !reviewer ? () => setReviewer(true) : undefined}
+          />
+        )}
 
         {final && <DecisionCard env={final} />}
 
@@ -192,8 +216,8 @@ export default function DemoDashboard() {
   );
 }
 
-function ModeBadge({ onchain, walletConnected }: { onchain: boolean; walletConnected: boolean }) {
-  const label = onchain ? "on-chain" : walletConnected ? "wallet · sim" : "simulation";
+function ModeBadge({ onchain, walletConnected, reviewer }: { onchain: boolean; walletConnected: boolean; reviewer: boolean }) {
+  const label = reviewer ? "reviewer · on-chain" : onchain ? "on-chain" : walletConnected ? "wallet · sim" : "simulation";
   const color = onchain ? "#34D399" : walletConnected ? "#A78BFA" : "#38BDF8";
   return (
     <span
@@ -255,7 +279,7 @@ function AgentColumn({ agent, state }: { agent: AgentId; state: StageState }) {
   );
 }
 
-function ErrorBanner({ message }: { message: string }) {
+function ErrorBanner({ message, onUseReviewer }: { message: string; onUseReviewer?: () => void }) {
   return (
     <div className="panel p-5" style={{ borderColor: "#FB718566" }} role="alert">
       <div className="flex items-start gap-3">
@@ -271,9 +295,32 @@ function ErrorBanner({ message }: { message: string }) {
           <p className="mt-2 text-[11px] text-fog">
             The error above is reported directly from the contract or SDK. No simulated result was substituted.
           </p>
+          {onUseReviewer && (
+            <div className="mt-3">
+              <p className="mb-1.5 text-[11px] text-fog">
+                Wallet or provider conflict? Skip the extension entirely:
+              </p>
+              <ReviewerFallbackButton onClick={onUseReviewer} />
+            </div>
+          )}
         </div>
       </div>
     </div>
+  );
+}
+
+// One-click switch to the ephemeral reviewer account. Bypasses every wallet
+// extension / MetaMask-Snap code path, so a multi-provider clash (MetaMask +
+// Phantom) can never block a steward from exercising the real contract.
+function ReviewerFallbackButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="inline-flex items-center gap-1.5 rounded-lg border border-verify/50 bg-verify/10 px-3 py-1.5 font-mono text-[11px] text-verify transition-colors hover:border-verify hover:bg-verify/20"
+      title="Run the real contract with a throwaway account — no wallet extension required"
+    >
+      <span aria-hidden>⚡</span> Use Ephemeral Reviewer Account
+    </button>
   );
 }
 

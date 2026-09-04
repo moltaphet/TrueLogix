@@ -18,6 +18,8 @@ export interface RunOptions {
   voteDelay?: number;
   // Connected wallet — enables the on-chain write path when a contract is set.
   wallet?: WalletHandle | null;
+  // Reviewer/demo mode — run on-chain with an ephemeral account (no wallet).
+  reviewer?: boolean;
 }
 
 export async function* runConsensus(
@@ -26,13 +28,15 @@ export async function* runConsensus(
 ): AsyncGenerator<StageEvent> {
   const stageDelay = opts.stageDelay ?? 620;
   const voteDelay = opts.voteDelay ?? 520;
-  const useOnchain = canRunOnchain(opts.wallet?.address);
+  const useOnchain = canRunOnchain(opts.wallet?.address, opts.reviewer);
 
   // Run on-chain when configured. Any failure throws out of this generator (see
   // evaluateOnchain -> OnchainError) so the UI can surface the real error — we do
   // NOT quietly fall back to the simulator and present mock data as if it were
   // an on-chain result.
-  const onchain = useOnchain ? await evaluateOnchain(input, opts.wallet) : null;
+  const onchain = useOnchain
+    ? await evaluateOnchain(input, { wallet: opts.wallet, reviewer: opts.reviewer })
+    : null;
 
   const agents: AgentId[] = ["A", "B", "C"];
   const envelopes = onchain
