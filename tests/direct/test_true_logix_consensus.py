@@ -8,8 +8,10 @@ Covered:
   * Malformed-LLM-JSON handling: hard revert (unrecoverable) and safe recovery
     (fenced / trailing-comma output the JSON safeguards clean up).
   * Deterministic input-validation reverts.
-  * Consensus AGREEMENT and DISAGREEMENT via the captured custom validators
-    (run_validator), plus leader-error -> forced disagreement.
+  * Consensus AGREEMENT and DISAGREEMENT for Agent A via its captured custom
+    validator (run_validator), plus leader-error -> forced disagreement.
+  * Agents B and C are deterministic pure Python (no nondet block), so they emit
+    no validator and can never be a disagreement source.
   * Deterministic run_id sequencing / persistence.
 
 Notes on the framework (gltest direct mode):
@@ -20,7 +22,9 @@ Notes on the framework (gltest direct mode):
     which re-runs the captured leader against the *current* mocks — so swapping a
     mock between `evaluate()` and `run_validator()` simulates a validator seeing a
     divergent LLM answer.
-  - Each `evaluate()` captures three validators: index 0 = A, 1 = B, 2 = C.
+  - Each `evaluate()` captures exactly ONE validator: index 0 = Agent A (the only
+    nondet/LLM stage). Agents B and C are deterministic Python, so they register
+    no validator.
 """
 
 import json
@@ -74,18 +78,6 @@ def env_b(overall="accept", rules=None, edges=None, confidence="1.00"):
     })
 
 
-def env_b_reject():
-    return env_b(
-        overall="reject",
-        rules=[
-            {"evidence_ref": ["total_amount"], "reason_code": "threshold_breach",
-             "rule_id": "r_amount_cap", "severity": "critical", "verdict": "fail"},
-        ],
-        edges=[{"edge_code": "value_out_of_range", "evidence_ref": ["total_amount"]}],
-        confidence="1.00",
-    )
-
-
 def env_c(decision="approve", cc="0.85", rationale=None, resolved=None, unresolved=None):
     return json.dumps({
         "agent": "C",
@@ -101,20 +93,6 @@ def env_c(decision="approve", cc="0.85", rationale=None, resolved=None, unresolv
         "schema_version": "1.0.0",
         "status": "ok",
     })
-
-
-def env_c_reject():
-    return env_c(
-        decision="reject",
-        cc="0.70",
-        rationale=["audit_ceiling_reject"],
-        resolved=[{
-            "conflict_id": "c_0",
-            "conflict_type": "fact_vs_rule",
-            "evidence_ref": ["r_amount_cap", "total_amount"],
-            "resolution_action": "defer_to_audit",
-        }],
-    )
 
 
 # --------------------------------------------------------------------------- #
@@ -161,7 +139,11 @@ def test_pipeline_clean_approve(direct_vm, direct_deploy, direct_alice):
     assert result["run_id"] == "run_0"
     assert result["status"] == "ok"
     assert result["final_decision"] == "approve"
-    assert result["combined_confidence"] == "0.85"
+    # Deterministic Agent C: combined = 0.40*c_a + 0.60*c_b. Both A (mocked "1.00")
+    # and the computed B ("1.00", every rule decidable and passing) are fully
+    # confident, so combined = 0.40 + 0.60 = "1.00". (Agent C is pure Python now,
+    # so the mocked env_c confidence is intentionally ignored.)
+    assert result["combined_confidence"] == "1.00"
     assert contract.get_run_count() == 1
 
 
@@ -203,9 +185,21 @@ def test_stage_b_consumes_agent_a_payload(direct_vm, direct_deploy, direct_alice
 # 3. Successful path — audit-driven rejection                                  #
 # --------------------------------------------------------------------------- #
 def test_pipeline_reject_flow(direct_vm, direct_deploy, direct_alice):
+    # Agents B and C are deterministic pure Python, so a rejection is driven by the
+    # FACTS Agent A extracts, not by a mocked B/C envelope. Here A extracts a
+    # total_amount that breaches the critical `r_amount_cap: total_amount<=1000`
+    # rule, so B computes overall_verdict=reject and C synthesizes final=reject.
     contract = direct_deploy(CONTRACT)
     direct_vm.sender = direct_alice
-    mock_all(direct_vm, b=env_b_reject(), c=env_c_reject())
+    over_cap_fields = [
+        {"evidence": "Total due: 1500.00 USD", "field_id": "currency",
+         "found": True, "value": "USD"},
+        {"evidence": "Total due: 1500.00 USD", "field_id": "total_amount",
+         "found": True, "value": "1500.00"},  # > 1000 cap -> critical fail
+        {"evidence": "Vendor: Acme", "field_id": "vendor_name",
+         "found": True, "value": "Acme"},
+    ]
+    mock_all(direct_vm, a=env_a(fields=over_cap_fields))
 
     result = _run(contract)
 
@@ -213,6 +207,9 @@ def test_pipeline_reject_flow(direct_vm, direct_deploy, direct_alice):
     record = json.loads(contract.get_latest())
     assert record["envelope_b"]["payload"]["overall_verdict"] == "reject"
     assert record["envelope_c"]["payload"]["rationale_codes"] == ["audit_ceiling_reject"]
+    # The critical breach is recorded as a fact-vs-rule conflict resolved by the audit.
+    resolved = record["envelope_c"]["payload"]["resolved_conflicts"]
+    assert resolved and resolved[0]["resolution_action"] == "defer_to_audit"
 
 
 # --------------------------------------------------------------------------- #
@@ -282,18 +279,17 @@ def test_input_validation_reverts(direct_vm, direct_deploy, direct_alice, src, s
 # --------------------------------------------------------------------------- #
 # 7. Consensus AGREEMENT — validators reproduce the leader projection          #
 # --------------------------------------------------------------------------- #
-def test_consensus_agreement_all_stages(direct_vm, direct_deploy, direct_alice):
+def test_consensus_agreement_agent_a(direct_vm, direct_deploy, direct_alice):
     contract = direct_deploy(CONTRACT)
     direct_vm.sender = direct_alice
     mock_all(direct_vm)
 
-    _run(contract)  # captures validators A=0, B=1, C=2
+    _run(contract)  # captures exactly one validator: Agent A (index 0)
 
-    # Mocks unchanged -> each validator re-runs the leader, gets the same
+    # Agent A is the ONLY nondet stage (B and C are deterministic Python). With the
+    # mocks unchanged the validator re-runs the leader, derives the identical
     # consensus-critical projection, and agrees.
     assert direct_vm.run_validator(index=0) is True   # Agent A
-    assert direct_vm.run_validator(index=1) is True   # Agent B
-    assert direct_vm.run_validator(index=2) is True   # Agent C
 
 
 # --------------------------------------------------------------------------- #
@@ -305,12 +301,16 @@ def test_consensus_disagreement_agent_a(direct_vm, direct_deploy, direct_alice):
     mock_all(direct_vm)
     _run(contract)
 
-    # A validator now sees a different extracted value for total_amount.
+    # Agent A's consensus-critical projection (_key_a) is the SET of
+    # (field_id, found) pairs — extracted values are deliberately tolerated so
+    # benign LLM noise never breaks consensus. So a disagreement requires a change
+    # to WHICH fields were found: here the validator fails to extract total_amount
+    # (found flips to false), changing the projection, so it must DISAGREE.
     divergent_fields = [
-        {"evidence": "Total due: 999.99 USD", "field_id": "currency",
+        {"evidence": "Total due: 500.00 USD", "field_id": "currency",
          "found": True, "value": "USD"},
-        {"evidence": "Total due: 999.99 USD", "field_id": "total_amount",
-         "found": True, "value": "999.99"},
+        {"evidence": None, "field_id": "total_amount",
+         "found": False, "value": None},
         {"evidence": "Vendor: Acme", "field_id": "vendor_name",
          "found": True, "value": "Acme"},
     ]
@@ -320,17 +320,22 @@ def test_consensus_disagreement_agent_a(direct_vm, direct_deploy, direct_alice):
     assert direct_vm.run_validator(index=0) is False
 
 
-def test_consensus_disagreement_agent_b(direct_vm, direct_deploy, direct_alice):
+def test_agents_b_and_c_are_deterministic_no_validator(direct_vm, direct_deploy, direct_alice):
+    # Agents B and C are pure Python computed inside the transaction's
+    # deterministic path — they are NOT nondet blocks. A single evaluate()
+    # therefore captures exactly ONE validator (Agent A, index 0); there is no
+    # Agent B or Agent C validator, so B/C can never vote "disagree" or trigger a
+    # leader rotation. This is what previously made an Agent-B disagreement test
+    # meaningless.
     contract = direct_deploy(CONTRACT)
     direct_vm.sender = direct_alice
-    mock_all(direct_vm)  # B says accept
+    mock_all(direct_vm)
+
     _run(contract)
 
-    # A B validator now reaches the opposite overall_verdict.
-    direct_vm.clear_mocks()
-    mock_all(direct_vm, b=env_b_reject())
-
-    assert direct_vm.run_validator(index=1) is False
+    assert direct_vm.run_validator(index=0) is True   # Agent A is the sole validator
+    with pytest.raises(IndexError):
+        direct_vm.run_validator(index=1)               # no Agent B validator exists
 
 
 def test_consensus_leader_error_forces_disagree(direct_vm, direct_deploy, direct_alice):
