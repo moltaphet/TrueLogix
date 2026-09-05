@@ -11,12 +11,14 @@ import { Section } from "./components/primitives";
 import { WalletProvider } from "./lib/wallet";
 import { ReviewerProvider } from "./lib/reviewerContext";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import WrongNetworkBanner from "./components/WrongNetworkBanner";
 
 export default function App() {
   return (
     <ErrorBoundary>
     <WalletProvider>
     <ReviewerProvider>
+    <WrongNetworkBanner />
     <div className="min-h-screen">
       <Nav />
       <main>

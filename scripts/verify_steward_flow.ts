@@ -151,7 +151,7 @@ async function main() {
   console.log(`tx_hash:  ${txHash}`);
   console.log(`run_id:   ${runId}`);
   console.log(`decision: ${parsed.final_decision ?? "unknown"}`);
-  console.log(`explorer: https://genlayer-explorer.vercel.app/transaction/${txHash}\n`);
+  console.log(`explorer: https://explorer-studio.genlayer.com/tx/${txHash}\n`);
   console.log("SUCCESS — all three steward gating questions verified. Exit 0.");
 }
 

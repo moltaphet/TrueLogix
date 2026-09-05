@@ -5,6 +5,49 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 
+// ---------------------------------------------------------------------------
+// StudioNet chain parameters (Chain ID 61999 / 0xF22F)
+// ---------------------------------------------------------------------------
+const STUDIONET_CHAIN_ID = 61999;
+export const STUDIONET_CHAIN_ID_HEX = "0xF22F";
+
+const STUDIONET_PARAMS = {
+  chainId: STUDIONET_CHAIN_ID_HEX,
+  chainName: "GenLayer StudioNet",
+  nativeCurrency: { name: "GEN", symbol: "GEN", decimals: 18 },
+  rpcUrls: ["https://studio.genlayer.com/api"],
+  blockExplorerUrls: ["https://explorer-studio.genlayer.com"],
+} as const;
+
+/**
+ * Attempt to switch the wallet to StudioNet.
+ *   - Tries wallet_switchEthereumChain first.
+ *   - On 4902 (chain not added) → calls wallet_addEthereumChain.
+ *   - On 4001 (user rejected) or any other error → re-throws so the caller
+ *     can surface the manual-switch banner instead of crashing.
+ */
+async function switchToStudioNet(provider: Eip1193Provider): Promise<void> {
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: STUDIONET_CHAIN_ID_HEX }],
+    });
+  } catch (switchErr: unknown) {
+    const code = (switchErr as { code?: number })?.code;
+    if (code === 4902) {
+      // Chain is not in the wallet's list — add it (this also switches to it).
+      await provider.request({
+        method: "wallet_addEthereumChain",
+        params: [STUDIONET_PARAMS],
+      });
+    } else {
+      // 4001 = user rejected, or unrecognised error.
+      // Re-throw so the caller shows the manual banner instead of silently failing.
+      throw switchErr;
+    }
+  }
+}
+
 export type WalletStatus = "unavailable" | "disconnected" | "connecting" | "connected";
 
 export interface WalletState {
@@ -16,6 +59,10 @@ export interface WalletState {
   status: WalletStatus;
   error: string | null;
   provider: Eip1193Provider | null;
+  // true when the wallet is connected but NOT on StudioNet (chain 61999).
+  wrongNetwork: boolean;
+  // Trigger a switch to StudioNet — used by the manual banner button.
+  switchNetwork: () => Promise<void>;
   connect: () => Promise<void>;
   disconnect: () => void;
 }
@@ -106,6 +153,26 @@ export function WalletProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const providerRef = useRef<Eip1193Provider | null>(null);
 
+  // Derived: connected on a chain other than StudioNet.
+  const wrongNetwork =
+    status === "connected" &&
+    chainId !== null &&
+    parseInt(chainId, 16) !== STUDIONET_CHAIN_ID;
+
+  // Exposed switch function — called by the manual banner button.
+  const switchNetwork = useCallback(async () => {
+    const p = providerRef.current;
+    if (!p) return;
+    // The native GenLayer provider already targets StudioNet — no RPC switch needed.
+    if (walletName === "GenLayer") return;
+    try {
+      await switchToStudioNet(p);
+      // chainChanged event will fire and update chainId automatically.
+    } catch {
+      // User rejected again — banner stays visible; nothing else to do.
+    }
+  }, [walletName]);
+
   const disconnect = useCallback(() => {
     setAddress(null);
     setChainId(null);
@@ -151,6 +218,18 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       setStatus("disconnected");
     }
   }, []);
+
+  // Auto-switch to StudioNet whenever the connected wallet drifts to another chain.
+  // Fires on first connect and on every subsequent chainChanged event. Errors are
+  // swallowed — if the user rejects, wrongNetwork stays true and the banner appears.
+  useEffect(() => {
+    if (!wrongNetwork) return;
+    const p = providerRef.current;
+    if (!p || walletName === "GenLayer") return;
+    switchToStudioNet(p).catch(() => {
+      // User rejected or unrecoverable — banner stays, no crash.
+    });
+  }, [wrongNetwork, walletName]);
 
   // Detect on mount, restore a prior session silently, and wire live events.
   useEffect(() => {
@@ -210,6 +289,8 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     status,
     error,
     provider: providerRef.current,
+    wrongNetwork,
+    switchNetwork,
     connect,
     disconnect,
   };

@@ -320,7 +320,7 @@ function ErrorBanner({ message, onUseReviewer }: { message: string; onUseReviewe
   );
 }
 
-const EXPLORER_BASE = "https://genlayer-explorer.vercel.app";
+const EXPLORER_BASE = "https://explorer-studio.genlayer.com";
 
 function TxHashBanner({ hash, pending }: { hash: string; pending?: boolean }) {
   const color = pending ? "#F59E0B" : "#34D399";
@@ -342,7 +342,7 @@ function TxHashBanner({ hash, pending }: { hash: string; pending?: boolean }) {
           </div>
         </div>
         <a
-          href={`${EXPLORER_BASE}/transaction/${hash}`}
+          href={`${EXPLORER_BASE}/tx/${hash}`}
           target="_blank"
           rel="noreferrer"
           className="shrink-0 rounded-lg border border-verify/50 bg-verify/10 px-3 py-1.5 font-mono text-[11px] text-verify transition-colors hover:border-verify hover:bg-verify/20"

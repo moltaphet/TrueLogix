@@ -26,7 +26,7 @@
 import { chains, createClient, createAccount } from "genlayer-js";
 
 const CONTRACT   = "0x59986bF610dDb4749992AA45E9302414E9fc379d";
-const EXPLORER   = "https://genlayer-explorer.vercel.app";
+const EXPLORER   = "https://explorer-studio.genlayer.com";
 const INTERVAL   = 5_000;   // ms between receipt polls
 const RETRIES    = 36;      // 5s × 36 = 180s total patience
 const RUN_ID_RE  = /run_\d+/;
@@ -117,7 +117,7 @@ async function main(): Promise<void> {
     throw new Error(`writeContract failed: ${toMessage(err)}`);
   }
   console.log(`      tx_hash  : ${txHash}`);
-  console.log(`      explorer : ${EXPLORER}/transaction/${txHash}\n`);
+  console.log(`      explorer : ${EXPLORER}/tx/${txHash}\n`);
 
   // Step 3 — poll for ACCEPTED receipt
   console.log(`[3/5] Polling receipt (ACCEPTED, up to ${RETRIES * INTERVAL / 1000}s)…`);
@@ -186,7 +186,7 @@ async function main(): Promise<void> {
   console.log(`  tx_hash  : ${txHash}`);
   console.log(`  run_id   : ${runId}`);
   console.log(`  decision : ${decision}`);
-  console.log(`  explorer : ${EXPLORER}/transaction/${txHash}`);
+  console.log(`  explorer : ${EXPLORER}/tx/${txHash}`);
   console.log("\nEXIT 0 — verification complete.");
 }
 
