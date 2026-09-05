@@ -82,4 +82,6 @@ export interface StageEvent {
   envelope?: AnyEnvelope;
   error?: string;
   mode: "simulation" | "onchain";
+  // Populated on the final done event when running on-chain.
+  tx_hash?: string;
 }

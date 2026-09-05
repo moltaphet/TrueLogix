@@ -233,6 +233,10 @@ export interface EvaluateOptions {
   // the "Use Ephemeral Reviewer Account" fallback so a steward can exercise the
   // contract on StudioNet with no wallet extension at all.
   reviewer?: boolean;
+  // Called the moment writeContract() resolves and the pending tx hash is known —
+  // long before the ACCEPTED receipt arrives. Lets the UI surface the explorer
+  // link immediately so the steward can watch the transaction live.
+  onTxSubmitted?: (txHash: string) => void;
 }
 
 /**
@@ -327,6 +331,9 @@ export async function evaluateOnchain(
   } catch (err) {
     throw new OnchainError(`Contract evaluate() reverted: ${toMessage(err)}`, err);
   }
+  // Fire immediately — the UI can show the pending hash and an explorer link right
+  // now, before the up-to-180s ACCEPTED receipt poll even starts.
+  options.onTxSubmitted?.(txHash);
 
   // Wait, patiently, for THIS transaction to reach a DECIDED state before reading
   // its result.

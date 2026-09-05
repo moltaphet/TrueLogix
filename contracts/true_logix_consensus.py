@@ -133,9 +133,17 @@ def _assemble_prompt(system: str, sections: list) -> str:
 
 
 def build_prompt_a(source_material: str, extraction_schema: str) -> str:
+    # Wrap caller-supplied data in <untrusted_input> tags so the model treats it
+    # as opaque content to transcribe, not as additional instructions to follow.
+    # This is the primary prompt-injection defence: even if the document contains
+    # text that looks like a directive ("Ignore all rules…"), the structural tag
+    # signals to the model that the enclosed text is data, not instructions.
     return _assemble_prompt(
         AGENT_A_SYSTEM,
-        [f"SOURCE_MATERIAL:\n{source_material}", f"EXTRACTION_SCHEMA:\n{extraction_schema}"],
+        [
+            "<untrusted_input>\nSOURCE_MATERIAL:\n" + source_material + "\n</untrusted_input>",
+            "<untrusted_input>\nEXTRACTION_SCHEMA:\n" + extraction_schema + "\n</untrusted_input>",
+        ],
     )
 
 

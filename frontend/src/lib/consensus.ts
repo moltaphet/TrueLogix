@@ -20,6 +20,9 @@ export interface RunOptions {
   wallet?: WalletHandle | null;
   // Reviewer/demo mode — run on-chain with an ephemeral account (no wallet).
   reviewer?: boolean;
+  // Forwarded to evaluateOnchain — fires the moment writeContract resolves so
+  // the UI can show the pending tx hash before the receipt poll even starts.
+  onTxSubmitted?: (txHash: string) => void;
 }
 
 export async function* runConsensus(
@@ -35,7 +38,11 @@ export async function* runConsensus(
   // NOT quietly fall back to the simulator and present mock data as if it were
   // an on-chain result.
   const onchain = useOnchain
-    ? await evaluateOnchain(input, { wallet: opts.wallet, reviewer: opts.reviewer })
+    ? await evaluateOnchain(input, {
+        wallet: opts.wallet,
+        reviewer: opts.reviewer,
+        onTxSubmitted: opts.onTxSubmitted,
+      })
     : null;
 
   const agents: AgentId[] = ["A", "B", "C"];
@@ -63,6 +70,8 @@ export async function* runConsensus(
       envelope: env,
       error: healthy ? undefined : "stage returned non-ok status",
       mode: onchain ? "onchain" : "simulation",
+      // Surface the transaction hash on the final agent so the UI can link to the explorer.
+      tx_hash: agent === "C" && onchain ? onchain.tx_hash : undefined,
     };
   }
 }

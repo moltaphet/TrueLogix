@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import WalletButton from "./WalletButton";
+import { useReviewer } from "../lib/reviewerContext";
+import { isOnchainConfigured } from "../lib/genlayer";
 
 const LINKS = [
   { href: "#demo", label: "Live demo" },
@@ -14,6 +16,8 @@ export const GITHUB_URL = "https://github.com/moltaphet/TrueLogix";
 export default function Nav() {
   const [scrolled, setScrolled] = useState(false);
   const [open, setOpen] = useState(false);
+  const { reviewer, enableReviewer } = useReviewer();
+  const contractConfigured = isOnchainConfigured();
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 12);
     onScroll();
@@ -44,6 +48,20 @@ export default function Nav() {
         </div>
 
         <div className="flex items-center gap-2">
+          {contractConfigured && !reviewer && (
+            <button
+              onClick={enableReviewer}
+              className="hidden items-center gap-1.5 rounded-lg border border-verify/50 bg-verify/10 px-3 py-1.5 font-mono text-[11px] text-verify transition-colors hover:border-verify hover:bg-verify/20 sm:inline-flex"
+              title="Run the real contract with a throwaway account — no wallet extension required"
+            >
+              <span aria-hidden>⚡</span> 1-Click Reviewer Mode
+            </button>
+          )}
+          {reviewer && (
+            <span className="hidden items-center gap-1.5 rounded-lg border border-verify/40 bg-verify/10 px-3 py-1.5 font-mono text-[11px] text-verify sm:inline-flex">
+              <span className="inline-block h-1.5 w-1.5 rounded-full bg-verify" /> reviewer active
+            </span>
+          )}
           <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hidden text-sm text-fog transition-colors hover:text-chalk lg:inline">
             GitHub ↗
           </a>
@@ -71,6 +89,22 @@ export default function Nav() {
               {l.label}
             </a>
           ))}
+          {contractConfigured && (
+            <div className="mt-2 border-t border-line pt-2">
+              {reviewer ? (
+                <span className="flex items-center gap-1.5 py-2 font-mono text-[11px] text-verify">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-verify" /> reviewer mode active
+                </span>
+              ) : (
+                <button
+                  onClick={() => { enableReviewer(); setOpen(false); }}
+                  className="flex w-full items-center gap-1.5 py-2 font-mono text-[11px] text-verify"
+                >
+                  <span aria-hidden>⚡</span> 1-Click Reviewer Mode
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
     </header>

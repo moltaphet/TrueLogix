@@ -4,6 +4,7 @@ import { AGENT_META, JsonView, Reveal } from "./primitives";
 import { runConsensus } from "../lib/consensus";
 import { canRunOnchain, isOnchainConfigured } from "../lib/genlayer";
 import { useWallet, shortAddress } from "../lib/wallet";
+import { useReviewer } from "../lib/reviewerContext";
 import { PRESETS } from "../lib/sampleData";
 import type {
   AgentId,
@@ -40,10 +41,9 @@ export default function DemoDashboard() {
   const [final, setFinal] = useState<EnvelopeC | null>(null);
   const [runId, setRunId] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  // Zero-friction reviewer path: run against the real contract with an ephemeral
-  // account (createAccount()) — no wallet extension, no Snap, no provider clash.
-  const [reviewer, setReviewer] = useState(false);
+  const [txHash, setTxHash] = useState<string | null>(null);
 
+  const { reviewer, enableReviewer, disableReviewer } = useReviewer();
   const wallet = useWallet();
   const walletConnected = wallet.status === "connected";
   const contractConfigured = isOnchainConfigured();
@@ -57,6 +57,7 @@ export default function DemoDashboard() {
     setRunning(true);
     setFinal(null);
     setError(null);
+    setTxHash(null);
     setStages(EMPTY);
     setActive(null);
     const rid = runId + 1;
@@ -68,7 +69,13 @@ export default function DemoDashboard() {
         : null;
 
     try {
-      for await (const ev of runConsensus(input, { wallet: walletHandle, reviewer })) {
+      for await (const ev of runConsensus(input, {
+        wallet: walletHandle,
+        reviewer,
+        // Fire as soon as writeContract() resolves — the ACCEPTED poll can take
+        // up to 180s; this lets the explorer link appear immediately.
+        onTxSubmitted: (hash) => setTxHash(hash),
+      })) {
         if (ev.phase === "running") setActive(ev.agent);
         setStages((prev) => ({
           ...prev,
@@ -77,6 +84,7 @@ export default function DemoDashboard() {
         if (ev.agent === "C" && (ev.phase === "done" || ev.phase === "error") && ev.envelope) {
           setFinal(ev.envelope as EnvelopeC);
         }
+        if (ev.tx_hash) setTxHash(ev.tx_hash);
       }
     } catch (err) {
       // On-chain failure — surface the real SDK / contract error verbatim rather
@@ -95,6 +103,7 @@ export default function DemoDashboard() {
     setStages(EMPTY);
     setFinal(null);
     setError(null);
+    setTxHash(null);
     setActive(null);
   }
 
@@ -155,7 +164,7 @@ export default function DemoDashboard() {
               Reviewer mode — signs evaluate() with an ephemeral account, then reads the stored record. No wallet extension needed.
             </p>
             <button
-              onClick={() => setReviewer(false)}
+              onClick={disableReviewer}
               className="font-mono text-[11px] text-fog underline decoration-dotted underline-offset-2 transition-colors hover:text-chalk"
             >
               Exit reviewer mode
@@ -178,7 +187,7 @@ export default function DemoDashboard() {
               Client-side simulation — no gas needed.{" "}
               <span className="text-agentA underline decoration-dotted underline-offset-2">Connect a wallet</span> to run on-chain.
             </button>
-            {contractConfigured && <ReviewerFallbackButton onClick={() => setReviewer(true)} />}
+            {contractConfigured && <ReviewerFallbackButton onClick={enableReviewer} />}
           </div>
         )}
       </Reveal>
@@ -198,9 +207,11 @@ export default function DemoDashboard() {
         {error && (
           <ErrorBanner
             message={error}
-            onUseReviewer={contractConfigured && !reviewer ? () => setReviewer(true) : undefined}
+            onUseReviewer={contractConfigured && !reviewer ? enableReviewer : undefined}
           />
         )}
+
+        {txHash && <TxHashBanner hash={txHash} pending={running} />}
 
         {final && <DecisionCard env={final} />}
 
@@ -304,6 +315,40 @@ function ErrorBanner({ message, onUseReviewer }: { message: string; onUseReviewe
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+const EXPLORER_BASE = "https://genlayer-explorer.vercel.app";
+
+function TxHashBanner({ hash, pending }: { hash: string; pending?: boolean }) {
+  const color = pending ? "#F59E0B" : "#34D399";
+  const label = pending ? "transaction submitted · polling…" : "transaction accepted · on-chain";
+  const icon = pending ? "⏳" : "✓";
+  return (
+    <div className="panel p-4" style={{ borderColor: color + "55" }}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <span
+            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md font-display text-sm font-bold"
+            style={{ background: color + "1f", color, boxShadow: `0 0 0 1px ${color}55` }}
+          >
+            {icon}
+          </span>
+          <div>
+            <div className="font-mono text-[10px] uppercase tracking-kicker text-fog">{label}</div>
+            <div className="mt-0.5 break-all font-mono text-[11px] text-fog-bright">{hash}</div>
+          </div>
+        </div>
+        <a
+          href={`${EXPLORER_BASE}/transaction/${hash}`}
+          target="_blank"
+          rel="noreferrer"
+          className="shrink-0 rounded-lg border border-verify/50 bg-verify/10 px-3 py-1.5 font-mono text-[11px] text-verify transition-colors hover:border-verify hover:bg-verify/20"
+        >
+          View on Explorer ↗
+        </a>
       </div>
     </div>
   );
